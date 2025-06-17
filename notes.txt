@@ -1,0 +1,3 @@
+Edit legality check for moves, utilizing instant move generation versus 'playing out' all pseudo legal moves
+  ensure compatability with en passant and pinned pieces
+Add magic bitboards to sliding piece logic
