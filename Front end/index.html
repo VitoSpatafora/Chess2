@@ -914,52 +914,60 @@
         }
 
         function navigateToMoveInHistory(index) {
-            if (index < 0 || index >= moveHistory.length) return; 
+            if (index < 0 || index >= moveHistory.length) return;
 
             currentMoveIndexInHistory = index;
-            deselectSquare(); 
+            deselectSquare();
             clearLastMoveHighlights();
 
-            // Restore state from the FEN stored *before* the move at this index
-            // or the initial FEN if it's the first entry.
-            const fenToLoad = moveHistory[index].fenBeforeMove;
-            if (!parseFEN(fenToLoad)) { // parseFEN updates boardState, currentPlayer, castling, ep, clocks
-                console.error("Failed to parse FEN from history:", fenToLoad);
-                return; // Avoid proceeding with bad state
+            // The state to load is the state *after* the move at 'index' has been made.
+            const historicMove = moveHistory[index];
+
+            // Manually restore the entire game state from the history object.
+            boardState = JSON.parse(JSON.stringify(historicMove.boardAfterMove));
+
+            // Determine the current player based on the restored state.
+            if (historicMove.notation === "Initial Position" || historicMove.notation === "Custom Setup" || historicMove.notation === "Loaded FEN") {
+                // For the initial state, get the player from the FEN string.
+                const parts = historicMove.fenBeforeMove.split(" ");
+                currentPlayer = (parts[1] === 'w') ? 'white' : 'black';
+            } else {
+                // For subsequent moves, the next player is the opponent of the player who made the move.
+                currentPlayer = historicMove.player === 'white' ? 'black' : 'white';
             }
-           
-            // If we are viewing a state that is the result of a move (not the initial setup)
-            // then set lastMove to that move.
-            if (moveHistory[index].from && moveHistory[index].to) {
-                lastMove = { from: moveHistory[index].from, to: moveHistory[index].to };
+
+            castlingRights = JSON.parse(JSON.stringify(historicMove.castlingRightsAfterMove));
+            enPassantTargetSquare = historicMove.enPassantTargetAfterMove ? JSON.parse(JSON.stringify(historicMove.enPassantTargetAfterMove)) : null;
+            halfmoveClock = historicMove.halfmoveClockAfterMove;
+            fullmoveNumber = historicMove.fullmoveNumberAfterMove;
+
+            if (historicMove.from && historicMove.to) {
+                lastMove = { from: historicMove.from, to: historicMove.to };
             } else {
                 lastMove = null; // For initial position
             }
 
-            // Update captured pieces based on the state *after* the move at this index
-            // (or empty if it's the initial position)
-            capturedByWhite = JSON.parse(JSON.stringify(moveHistory[index].capturedByWhiteAfterMove || []));
-            capturedByBlack = JSON.parse(JSON.stringify(moveHistory[index].capturedByBlackAfterMove || []));
-           
-            renderPieces(); // Uses global boardState which parseFEN updated
-            highlightLastMoveOnBoard(); // Uses global lastMove
-            renderMoveHistory(); 
-            updatePlayerInfoAndCapturedDisplays(); // Uses global captured lists
-            updateClockDisplays(); 
-           
-            if (currentMoveIndexInHistory === moveHistory.length -1 && !gameOver) {
-                // currentPlayer is already set by parseFEN to who's next for fenToLoad
+            capturedByWhite = JSON.parse(JSON.stringify(historicMove.capturedByWhiteAfterMove || []));
+            capturedByBlack = JSON.parse(JSON.stringify(historicMove.capturedByBlackAfterMove || []));
+
+            // Now render everything based on this restored state
+            createBoardUI(); // This will call renderPieces() and highlightLastMoveOnBoard() internally.
+            renderMoveHistory();
+            updatePlayerInfoAndCapturedDisplays();
+            updateClockDisplays();
+            
+            // Update status message and clock
+            if (currentMoveIndexInHistory === moveHistory.length - 1 && !gameOver) {
                 statusMessageDiv.textContent = `${currentPlayer.charAt(0).toUpperCase() + currentPlayer.slice(1)}'s turn.`;
-                if(gameTimeMode > 0) startClock(); 
-                checkAIPlay(); 
+                if (gameTimeMode > 0) startClock();
+                checkAIPlay();
             } else {
-                statusMessageDiv.textContent = `Viewing: ${moveHistory[index].notation}`;
+                statusMessageDiv.textContent = `Viewing after: ${historicMove.notation}`;
                 stopClock();
             }
-            // Arrows are cleared on new move, so when navigating history, they should also be cleared
-            // unless specific logic is added to store/restore arrows with history (not implemented here)
-            arrowsOnBoard = []; 
-            drawCurrentArrows(); 
+            
+            arrowsOnBoard = [];
+            drawCurrentArrows();
         }
 
 
