@@ -1,6 +1,8 @@
-Edit legality check for moves, utilizing instant move generation versus 'playing out' all pseudo legal moves
+-Edit legality check for moves, utilizing instant move generation versus 'playing out' all pseudo legal moves
   ensure compatability with en passant and pinned pieces
-Add magic bitboards to sliding piece logic
+-Add magic bitboards to sliding piece logic
+-Move Trasposition table to Python file to build across moves
+-Edit method for 3 fold repetition detection
 
 
 add premove to UI
