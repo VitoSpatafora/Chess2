@@ -1,4 +1,5 @@
--edit apply move method to avoid having to copy the position object for every move during search (extremely costly with current implementation)
+-edit use of apply move by adding undo move method... this will prevent having to copy position element
+  could get messy so be careful
 -Add magic bitboards to sliding piece logic
 -Move Trasposition table to Python file to build across moves
 -Edit method for 3 fold repetition detection
