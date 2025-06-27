@@ -228,7 +228,7 @@ def decode_cpp_move_to_js(cpp_move_int, player_who_moved_color):
     }
 
 # Store engine and its depth globally
-ENGINE_SEARCH_DEPTH = 6 # Example depth
+ENGINE_SEARCH_DEPTH = 8 # Example depth
 engine = None
 try:
     engine = chesscore.Engine(ENGINE_SEARCH_DEPTH)
@@ -329,7 +329,7 @@ if __name__ == '__main__':
         print("Flask app will run, but AI functionality (get-ai-move) will be broken due to chesscore.Engine initialization failure.")
 
     run_perft_test = False # Set to True to run perft on startup
-    fen_to_test = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    fen_to_test = "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1"
 
     if run_perft_test:
         print("\n--- Running Perft Test ---")

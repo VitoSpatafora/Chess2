@@ -14,6 +14,25 @@
  * - Added precomputed attack tables for non-sliding pieces.
  * - `isSquareAttacked()` completely rewritten to use fast bitboard operations,
  * removing the major performance bottleneck.
+ *
+ * REFACTOR 2:
+ * - Rewrote move generation to be fully legal.
+ * - `generateMoves` now correctly handles checks, double checks, and pins
+ * without simulating moves.
+ * - Added helper functions to get attackers and calculate pin rays.
+ * - Corrected pin handling logic, especially for en-passant captures.
+ *
+ * REFACTOR 3:
+ * - Refactored and corrected the pin detection logic in `generateMoves`.
+ * - Pin detection now correctly handles multiple pieces on a ray, preventing
+ * false positives and missed pins.
+ * - Corrected `get_ray_between` to exclude endpoints as per its contract.
+ *
+ * REFACTOR 4:
+ * - Fixed a critical bug in king move generation where the king could move
+ * along a sliding piece's attack ray.
+ * - `isSquareAttacked` is now overloaded to accept a custom occupancy, allowing
+ * king moves to be validated as if the king is not on the board.
  */
 
 #ifndef CHESS_ENGINE_HPP
@@ -121,6 +140,17 @@ namespace attacks {
     std::array<Bitboard, 64> knight_attacks_table;
     std::array<Bitboard, 64> king_attacks_table;
     std::array<std::array<Bitboard, 64>, 2> pawn_attacks_table; // [color][square]
+    std::array<Bitboard, 64> ray_n, ray_s, ray_e, ray_w;
+    std::array<Bitboard, 64> ray_ne, ray_nw, ray_se, ray_sw;
+    std::array<std::array<Bitboard, 64>, 64> line_between_bb;
+
+    inline Bitboard get_ray_between(int sq1, int sq2) {
+        return line_between_bb[sq1][sq2] & (~((1ULL << sq1) | (1ULL << sq2)));
+    }
+
+    inline Bitboard get_line_through(int sq1, int sq2) {
+        return line_between_bb[sq1][sq2];
+    }
 
     void init() {
         for (int sq = 0; sq < 64; ++sq) {
@@ -155,6 +185,34 @@ namespace attacks {
             if (on_board_rf(r + 1, f + 1)) pawn_attacks_table[0][sq] |= (1ULL << square(r + 1, f + 1));
             if (on_board_rf(r - 1, f - 1)) pawn_attacks_table[1][sq] |= (1ULL << square(r - 1, f - 1));
             if (on_board_rf(r - 1, f + 1)) pawn_attacks_table[1][sq] |= (1ULL << square(r - 1, f + 1));
+
+            // Rays
+            for(int i = 1; r+i < 8; ++i) ray_n[sq] |= (1ULL << square(r+i, f));
+            for(int i = 1; r-i >=0; ++i) ray_s[sq] |= (1ULL << square(r-i, f));
+            for(int i = 1; f+i < 8; ++i) ray_e[sq] |= (1ULL << square(r, f+i));
+            for(int i = 1; f-i >=0; ++i) ray_w[sq] |= (1ULL << square(r, f-i));
+            for(int i = 1; r+i<8 && f+i<8; ++i) ray_ne[sq] |= (1ULL << square(r+i, f+i));
+            for(int i = 1; r+i<8 && f-i>=0; ++i) ray_nw[sq] |= (1ULL << square(r+i, f-i));
+            for(int i = 1; r-i>=0 && f+i<8; ++i) ray_se[sq] |= (1ULL << square(r-i, f+i));
+            for(int i = 1; r-i>=0 && f-i>=0; ++i) ray_sw[sq] |= (1ULL << square(r-i, f-i));
+        }
+
+        for (int sq1 = 0; sq1 < 64; ++sq1) {
+            for (int sq2 = 0; sq2 < 64; ++sq2) {
+                line_between_bb[sq1][sq2] = 0;
+                if (sq1 == sq2) continue;
+                if (file_of(sq1) == file_of(sq2)) { // Vertical
+                    line_between_bb[sq1][sq2] = (ray_n[sq1] & ray_s[sq2]) | (ray_s[sq1] & ray_n[sq2]) | (1ULL << sq1) | (1ULL << sq2);
+                } else if (rank_of(sq1) == rank_of(sq2)) { // Horizontal
+                    line_between_bb[sq1][sq2] = (ray_e[sq1] & ray_w[sq2]) | (ray_w[sq1] & ray_e[sq2]) | (1ULL << sq1) | (1ULL << sq2);
+                } else if (std::abs(rank_of(sq1) - rank_of(sq2)) == std::abs(file_of(sq1) - file_of(sq2))) { // Diagonal
+                    if ((file_of(sq2) > file_of(sq1) && rank_of(sq2) > rank_of(sq1)) || (file_of(sq1) > file_of(sq2) && rank_of(sq1) > rank_of(sq2))) {
+                        line_between_bb[sq1][sq2] = (ray_ne[sq1] & ray_sw[sq2]) | (ray_sw[sq1] & ray_ne[sq2]) | (1ULL << sq1) | (1ULL << sq2);
+                    } else {
+                        line_between_bb[sq1][sq2] = (ray_nw[sq1] & ray_se[sq2]) | (ray_se[sq1] & ray_nw[sq2]) | (1ULL << sq1) | (1ULL << sq2);
+                    }
+                }
+            }
         }
     }
 
@@ -401,7 +459,7 @@ public:
 
         for (int current_iter_depth = 1; current_iter_depth <= this->maxDepth; ++current_iter_depth) {
             std::vector<Move> root_moves;
-            generateLegalMoves(root_pos, root_moves);
+            generateMoves(root_pos, root_moves);
 
             if (root_moves.empty()) {
                  return 0;
@@ -467,7 +525,7 @@ public:
 
 
         std::vector<Move> legal_moves;
-        generateLegalMoves(pos, legal_moves);
+        generateMoves(pos, legal_moves);
 
         if (legal_moves.empty()) {
             int king_piece_idx = pos.whiteToMove ? W_KING : B_KING;
@@ -490,24 +548,28 @@ public:
     uint64_t perft(Position& p, int depth) {
         if (p.currentHash == 0) p.computeAndSetHash();
 
-        if (depth == 0) {
-            return 1ULL;
-        }
+        std::cout << "Starting Perft for depth " << depth << std::endl;
 
         std::vector<Move> legal_moves;
-        generateLegalMoves(p, legal_moves);
-        uint64_t nodes = 0;
+        generateMoves(p, legal_moves);
 
-        if (depth == 1) {
-            return static_cast<uint64_t>(legal_moves.size());
-        }
+        uint64_t total_nodes = 0;
+
+        // Sort moves alphabetically for consistent output
+        std::sort(legal_moves.begin(), legal_moves.end(), [](Move a, Move b){
+            return moveToString(a) < moveToString(b);
+        });
 
         for (Move m : legal_moves) {
             Position next_pos = p;
             applyMove(next_pos, m);
-            nodes += perft(next_pos, depth - 1);
+            uint64_t nodes_for_move = perft_recursive(next_pos, depth - 1);
+            total_nodes += nodes_for_move;
+            std::cout << moveToString(m) << ": " << nodes_for_move << std::endl;
         }
-        return nodes;
+
+        std::cout << "\nTotal nodes: " << total_nodes << std::endl;
+        return total_nodes;
     }
 
     static uint64_t getHashForPosition(const Position& p){
@@ -535,6 +597,90 @@ public:
         return nodes_visited_search;
     }
 
+    void generateMoves(const Position& p, std::vector<Move>& moves) const {
+        moves.clear();
+        const bool is_white = p.whiteToMove;
+        const int king_piece = is_white ? W_KING : B_KING;
+        const int king_sq = lsb_idx(p.bb[king_piece]);
+        const Bitboard friendly_pieces = is_white ? p.occWhite : p.occBlack;
+
+        if (king_sq == -1) return;
+
+        const Bitboard checkers = get_attackers(p, king_sq, !is_white);
+        const int num_checkers = popcount(checkers);
+
+        Bitboard check_resolution_mask = ~0ULL;
+
+        if (num_checkers > 1) { // Double check, only king moves are possible.
+            add_king_moves(p, king_sq, moves);
+            return;
+        }
+        if (num_checkers == 1) { // Single check
+            int checker_sq = lsb_idx(checkers);
+            check_resolution_mask = (1ULL << checker_sq); // Can capture the checker
+            Piece checker_piece = p.piece_at(checker_sq);
+
+            if (checker_piece == (is_white ? B_BISHOP : W_BISHOP) ||
+                checker_piece == (is_white ? B_ROOK : W_ROOK) ||
+                checker_piece == (is_white ? B_QUEEN : W_QUEEN))
+            {
+                check_resolution_mask |= attacks::get_ray_between(king_sq, checker_sq);
+            }
+        }
+
+        Bitboard pinned = 0ULL;
+        std::array<Bitboard, 64> pin_ray_map{};
+
+        // Refactored Pin Detection
+        const Bitboard enemy_rooks_queens = is_white ? (p.bb[B_ROOK] | p.bb[B_QUEEN]) : (p.bb[W_ROOK] | p.bb[W_QUEEN]);
+        const Bitboard enemy_bishops_queens = is_white ? (p.bb[B_BISHOP] | p.bb[B_QUEEN]) : (p.bb[W_BISHOP] | p.bb[W_QUEEN]);
+
+        Bitboard potential_pinners = (attacks::get_rook_attacks(king_sq, 0) & enemy_rooks_queens) |
+                                     (attacks::get_bishop_attacks(king_sq, 0) & enemy_bishops_queens);
+
+        Bitboard temp_pinners = potential_pinners;
+        while (temp_pinners) {
+            int pinner_sq = lsb_idx(temp_pinners);
+            temp_pinners &= temp_pinners - 1;
+
+            Bitboard ray_between = attacks::get_ray_between(king_sq, pinner_sq);
+
+            if (popcount(ray_between & p.occ) == 1) {
+                Bitboard pinned_piece_bb = ray_between & friendly_pieces;
+                if (pinned_piece_bb) {
+                    int pinned_sq = lsb_idx(pinned_piece_bb);
+                    pinned |= (1ULL << pinned_sq);
+                    pin_ray_map[pinned_sq] = attacks::get_line_through(king_sq, pinner_sq);
+                }
+            }
+        }
+
+        // Generate moves for all non-king pieces, applying masks
+        Piece start_p = is_white ? W_PAWN : B_PAWN;
+        Piece end_p = is_white ? W_QUEEN : B_QUEEN;
+
+        for (int p_type = start_p; p_type <= end_p; ++p_type) {
+            Bitboard piece_bb = p.bb[p_type];
+            while(piece_bb) {
+                int from_sq = lsb_idx(piece_bb);
+                Bitboard move_mask = check_resolution_mask;
+                if (pinned & (1ULL << from_sq)) {
+                    move_mask &= pin_ray_map[from_sq];
+                }
+
+                Piece piece_enum = static_cast<Piece>(p_type);
+                if (piece_enum == W_PAWN || piece_enum == B_PAWN) add_pawn_moves(p, from_sq, moves, move_mask);
+                else if (piece_enum == W_KNIGHT || piece_enum == B_KNIGHT) add_knight_moves(p, from_sq, moves, move_mask);
+                else if (piece_enum == W_BISHOP || piece_enum == B_BISHOP) add_sliding_moves(p, from_sq, true, false, moves, move_mask);
+                else if (piece_enum == W_ROOK || piece_enum == B_ROOK) add_sliding_moves(p, from_sq, false, true, moves, move_mask);
+                else if (piece_enum == W_QUEEN || piece_enum == B_QUEEN) add_sliding_moves(p, from_sq, true, true, moves, move_mask);
+
+                piece_bb &= piece_bb - 1;
+            }
+        }
+        add_king_moves(p, king_sq, moves);
+    }
+
 
 private:
     const int INF=std::numeric_limits<int>::max() - 200000;
@@ -542,6 +688,41 @@ private:
     long nodes_visited_search = 0;
 
     std::unordered_map<uint64_t, TranspositionTableEntry> transposition_table;
+
+    uint64_t perft_recursive(Position& p, int depth) {
+        if (depth == 0) {
+            return 1ULL;
+        }
+
+        std::vector<Move> legal_moves;
+        generateMoves(p, legal_moves);
+
+        if (depth == 1) {
+            return static_cast<uint64_t>(legal_moves.size());
+        }
+
+        uint64_t nodes = 0;
+        for (Move m : legal_moves) {
+            Position next_pos = p;
+            applyMove(next_pos, m);
+            nodes += perft_recursive(next_pos, depth - 1);
+        }
+        return nodes;
+    }
+
+    Bitboard get_attackers(const Position& p, int sq, bool by_white) const {
+        Bitboard attackers = 0ULL;
+        const Bitboard enemy_rooks_queens = by_white ? (p.bb[W_ROOK] | p.bb[W_QUEEN]) : (p.bb[B_ROOK] | p.bb[B_QUEEN]);
+        const Bitboard enemy_bishops_queens = by_white ? (p.bb[W_BISHOP] | p.bb[W_QUEEN]) : (p.bb[B_BISHOP] | p.bb[B_QUEEN]);
+
+        attackers |= (attacks::pawn_attacks_table[by_white ? 1 : 0][sq] & (by_white ? p.bb[W_PAWN] : p.bb[B_PAWN]));
+        attackers |= (attacks::knight_attacks_table[sq] & (by_white ? p.bb[W_KNIGHT] : p.bb[B_KNIGHT]));
+        attackers |= (attacks::king_attacks_table[sq] & (by_white ? p.bb[W_KING] : p.bb[B_KING]));
+        attackers |= (attacks::get_rook_attacks(sq, p.occ) & enemy_rooks_queens);
+        attackers |= (attacks::get_bishop_attacks(sq, p.occ) & enemy_bishops_queens);
+
+        return attackers;
+    }
 
     int get_piece_type_value_index(Piece p) const {
         if (p >= W_PAWN && p <= W_KING) return p - W_PAWN;
@@ -637,7 +818,7 @@ private:
         }
 
         std::vector<Move> moves;
-        generateLegalMoves(p, moves);
+        generateMoves(p, moves);
 
         if (moves.empty()) {
             int king_piece_idx = p.whiteToMove ? W_KING : B_KING;
@@ -721,59 +902,84 @@ private:
         return best_score_for_node;
     }
 
-    void add_pawn_moves(const Position& p, int from_sq, std::vector<Move>& moves) const {
-        bool is_white = p.whiteToMove;
-        int dir = is_white ? 1 : -1;
-        int move_one_step_idx_change = dir * 8;
-        int move_two_steps_idx_change = dir * 16;
+    void add_pawn_moves(const Position& p, int from_sq, std::vector<Move>& moves, Bitboard target_mask) const {
+        const bool is_white = p.whiteToMove;
+        const int dir = is_white ? 8 : -8;
+        const Bitboard enemy_pieces = is_white ? p.occBlack : p.occWhite;
+        const Bitboard promotion_rank = is_white ? RANK_8 : RANK_1;
+        const Bitboard start_rank = is_white ? RANK_2 : RANK_7;
 
-        int start_rank_board_idx = is_white ? 1 : 6;
-        int promotion_rank_board_idx = is_white ? 7 : 0;
-
-        int to_sq1 = from_sq + move_one_step_idx_change;
-        if (on_board(to_sq1) && !(p.occ & (1ULL << to_sq1))) {
-            if (rank_of(to_sq1) == promotion_rank_board_idx) {
-                moves.push_back(encodeMove(from_sq, to_sq1, PROMO_TYPE_Q));
-                moves.push_back(encodeMove(from_sq, to_sq1, PROMO_TYPE_R));
-                moves.push_back(encodeMove(from_sq, to_sq1, PROMO_TYPE_B));
-                moves.push_back(encodeMove(from_sq, to_sq1, PROMO_TYPE_N));
-            } else {
-                moves.push_back(encodeMove(from_sq, to_sq1));
+        // 1. Pawn Pushes
+        int to_sq_one_step = from_sq + dir;
+        if (!(p.occ & (1ULL << to_sq_one_step))) { // If square in front is empty
+            if (target_mask & (1ULL << to_sq_one_step)) { // And move is on pin-ray / resolves check
+                if (promotion_rank & (1ULL << to_sq_one_step)) {
+                    moves.push_back(encodeMove(from_sq, to_sq_one_step, PROMO_TYPE_Q));
+                    moves.push_back(encodeMove(from_sq, to_sq_one_step, PROMO_TYPE_R));
+                    moves.push_back(encodeMove(from_sq, to_sq_one_step, PROMO_TYPE_B));
+                    moves.push_back(encodeMove(from_sq, to_sq_one_step, PROMO_TYPE_N));
+                } else {
+                    moves.push_back(encodeMove(from_sq, to_sq_one_step));
+                }
             }
 
-            if (rank_of(from_sq) == start_rank_board_idx) {
-                int to_sq2 = from_sq + move_two_steps_idx_change;
-                if (on_board(to_sq2) && !(p.occ & (1ULL << to_sq2))) {
-                    moves.push_back(encodeMove(from_sq, to_sq2, PROMO_TYPE_NONE, DPP_FLAG));
+            // 2. Double Pawn Push
+            if (start_rank & (1ULL << from_sq)) {
+                int to_sq_two_steps = from_sq + dir * 2;
+                if (!(p.occ & (1ULL << to_sq_two_steps))) { // If two squares in front is empty
+                    if (target_mask & (1ULL << to_sq_two_steps)) { // And move is on pin-ray / resolves check
+                        moves.push_back(encodeMove(from_sq, to_sq_two_steps, PROMO_TYPE_NONE, DPP_FLAG));
+                    }
                 }
             }
         }
 
-        for (int df = -1; df <= 1; df += 2) {
-            int capture_col_offset = df;
-            int to_sq_cap = from_sq + move_one_step_idx_change + capture_col_offset;
+        // 3. Pawn Captures
+        Bitboard pawn_attacks = attacks::pawn_attacks_table[is_white ? 0 : 1][from_sq];
+        Bitboard valid_captures = pawn_attacks & enemy_pieces & target_mask;
+        while (valid_captures) {
+            int to_sq = lsb_idx(valid_captures);
+            if (promotion_rank & (1ULL << to_sq)) {
+                moves.push_back(encodeMove(from_sq, to_sq, PROMO_TYPE_Q));
+                moves.push_back(encodeMove(from_sq, to_sq, PROMO_TYPE_R));
+                moves.push_back(encodeMove(from_sq, to_sq, PROMO_TYPE_B));
+                moves.push_back(encodeMove(from_sq, to_sq, PROMO_TYPE_N));
+            } else {
+                moves.push_back(encodeMove(from_sq, to_sq));
+            }
+            valid_captures &= valid_captures - 1;
+        }
 
-            if (on_board(to_sq_cap) && file_of(to_sq_cap) == (file_of(from_sq) + capture_col_offset)) {
-                Bitboard enemy_occ = is_white ? p.occBlack : p.occWhite;
-                if (enemy_occ & (1ULL << to_sq_cap)) {
-                    if (rank_of(to_sq_cap) == promotion_rank_board_idx) {
-                        moves.push_back(encodeMove(from_sq, to_sq_cap, PROMO_TYPE_Q));
-                        moves.push_back(encodeMove(from_sq, to_sq_cap, PROMO_TYPE_R));
-                        moves.push_back(encodeMove(from_sq, to_sq_cap, PROMO_TYPE_B));
-                        moves.push_back(encodeMove(from_sq, to_sq_cap, PROMO_TYPE_N));
-                    } else {
-                        moves.push_back(encodeMove(from_sq, to_sq_cap));
+        // 4. En Passant
+        if (p.epSquare != -1) {
+            // The target square for an e.p. capture must be in the target_mask.
+            // This handles cases where the capturing pawn is pinned.
+            if (target_mask & (1ULL << p.epSquare)) {
+                // Check if the pawn actually attacks the en-passant square.
+                if (attacks::pawn_attacks_table[is_white ? 0 : 1][from_sq] & (1ULL << p.epSquare)) {
+                    // This is the special case: check for a horizontal discovered attack on the king.
+                    // This happens when the king, the capturing pawn, and the captured pawn are all on the same rank.
+                    int captured_pawn_sq = p.epSquare + (is_white ? -8 : 8);
+                    Bitboard occupancy_without_pawns = (p.occ ^ (1ULL << from_sq) ^ (1ULL << captured_pawn_sq));
+                    int king_sq = lsb_idx(p.bb[is_white ? W_KING : B_KING]);
+
+                    const Bitboard enemy_rooks_queens = is_white ? (p.bb[B_ROOK] | p.bb[B_QUEEN]) : (p.bb[W_ROOK] | p.bb[W_QUEEN]);
+                    const Bitboard enemy_bishops_queens = is_white ? (p.bb[B_BISHOP] | p.bb[B_QUEEN]) : (p.bb[W_BISHOP] | p.bb[W_QUEEN]);
+
+                    // If removing both pawns does not result in the king being attacked, the move is legal.
+                    if ((attacks::get_rook_attacks(king_sq, occupancy_without_pawns) & enemy_rooks_queens) == 0 &&
+                        (attacks::get_bishop_attacks(king_sq, occupancy_without_pawns) & enemy_bishops_queens) == 0)
+                    {
+                        moves.push_back(encodeMove(from_sq, p.epSquare, PROMO_TYPE_NONE, EP_FLAG));
                     }
-                } else if (to_sq_cap == p.epSquare) {
-                    moves.push_back(encodeMove(from_sq, to_sq_cap, PROMO_TYPE_NONE, EP_FLAG));
                 }
             }
         }
     }
 
-    void add_knight_moves(const Position& p, int from_sq, std::vector<Move>& moves) const {
+    void add_knight_moves(const Position& p, int from_sq, std::vector<Move>& moves, Bitboard target_mask) const {
         Bitboard friendly_occ = p.whiteToMove ? p.occWhite : p.occBlack;
-        Bitboard knight_moves = attacks::knight_attacks_table[from_sq] & ~friendly_occ;
+        Bitboard knight_moves = attacks::knight_attacks_table[from_sq] & ~friendly_occ & target_mask;
 
         while(knight_moves) {
             int to_sq = lsb_idx(knight_moves);
@@ -782,7 +988,7 @@ private:
         }
     }
 
-    void add_sliding_moves(const Position& p, int from_sq, bool is_bishop, bool is_rook, std::vector<Move>& moves) const {
+    void add_sliding_moves(const Position& p, int from_sq, bool is_bishop, bool is_rook, std::vector<Move>& moves, Bitboard target_mask) const {
         Bitboard friendly_occ = p.whiteToMove ? p.occWhite : p.occBlack;
         Bitboard slide_moves = 0ULL;
 
@@ -794,6 +1000,7 @@ private:
         }
 
         slide_moves &= ~friendly_occ;
+        slide_moves &= target_mask;
 
         while(slide_moves) {
             int to_sq = lsb_idx(slide_moves);
@@ -805,10 +1012,13 @@ private:
     void add_king_moves(const Position& p, int from_sq, std::vector<Move>& moves) const {
         Bitboard friendly_occ = p.whiteToMove ? p.occWhite : p.occBlack;
         Bitboard king_moves = attacks::king_attacks_table[from_sq] & ~friendly_occ;
+        Bitboard blockers_without_king = p.occ & ~(1ULL << from_sq);
 
         while (king_moves) {
             int to_sq = lsb_idx(king_moves);
-            moves.push_back(encodeMove(from_sq, to_sq));
+            if (!isSquareAttacked(p, to_sq, !p.whiteToMove, blockers_without_king)) {
+                 moves.push_back(encodeMove(from_sq, to_sq));
+            }
             king_moves &= king_moves - 1;
         }
 
@@ -839,56 +1049,11 @@ private:
         }
     }
 
-    void generatePseudoLegalMoves(const Position& p, std::vector<Move>& moves) const {
-        moves.clear();
-        Piece start_piece_idx = p.whiteToMove ? W_PAWN : B_PAWN;
-        Piece end_piece_idx   = p.whiteToMove ? W_KING : B_KING;
-
-        for (int piece_type_val = start_piece_idx; piece_type_val <= end_piece_idx; ++piece_type_val) {
-            Bitboard current_bb = p.bb[piece_type_val];
-            while (current_bb) {
-                int from_sq = lsb_idx(current_bb);
-                Piece pt = static_cast<Piece>(piece_type_val);
-
-                if (pt == W_PAWN || pt == B_PAWN) add_pawn_moves(p, from_sq, moves);
-                else if (pt == W_KNIGHT || pt == B_KNIGHT) add_knight_moves(p, from_sq, moves);
-                else if (pt == W_BISHOP || pt == B_BISHOP) add_sliding_moves(p, from_sq, true, false, moves);
-                else if (pt == W_ROOK || pt == B_ROOK) add_sliding_moves(p, from_sq, false, true, moves);
-                else if (pt == W_QUEEN || pt == B_QUEEN) add_sliding_moves(p, from_sq, true, true, moves);
-                else if (pt == W_KING || pt == B_KING) add_king_moves(p, from_sq, moves);
-
-                current_bb &= current_bb - 1;
-            }
-        }
-    }
-
-    void generateLegalMoves(const Position& p, std::vector<Move>& legal_moves) const {
-        legal_moves.clear();
-        std::vector<Move> pseudo_legal;
-        generatePseudoLegalMoves(p, pseudo_legal);
-
-        Piece king_piece_for_current_player = p.whiteToMove ? W_KING : B_KING;
-
-        for (Move m : pseudo_legal) {
-            Position next_pos = p;
-            applyMove(next_pos, m); // This is slow, but correct for now. Future optimization here.
-
-            Bitboard king_bb_after_move = next_pos.bb[king_piece_for_current_player];
-
-            if (king_bb_after_move == 0) {
-                 continue;
-            }
-            int king_sq_after_move = lsb_idx(king_bb_after_move);
-
-            // Check if own king is attacked by the opponent
-            if (!isSquareAttacked(next_pos, king_sq_after_move, next_pos.whiteToMove )) {
-                legal_moves.push_back(m);
-            }
-        }
-    }
-
-    // **REFACTORED**: Now uses fast bitboard operations.
     bool isSquareAttacked(const Position& p, int sq_to_check, bool by_white_attacker) const {
+        return isSquareAttacked(p, sq_to_check, by_white_attacker, p.occ);
+    }
+
+    bool isSquareAttacked(const Position& p, int sq_to_check, bool by_white_attacker, Bitboard blockers) const {
         Bitboard pawn_attackers   = by_white_attacker ? p.bb[W_PAWN] : p.bb[B_PAWN];
         Bitboard knight_attackers = by_white_attacker ? p.bb[W_KNIGHT] : p.bb[B_KNIGHT];
         Bitboard king_attackers   = by_white_attacker ? p.bb[W_KING] : p.bb[B_KING];
@@ -901,8 +1066,8 @@ private:
         if (attacks::pawn_attacks_table[color_idx][sq_to_check] & pawn_attackers) return true;
         if (attacks::knight_attacks_table[sq_to_check] & knight_attackers) return true;
         if (attacks::king_attacks_table[sq_to_check] & king_attackers) return true;
-        if (attacks::get_bishop_attacks(sq_to_check, p.occ) & bishop_queen_attackers) return true;
-        if (attacks::get_rook_attacks(sq_to_check, p.occ) & rook_queen_attackers) return true;
+        if (attacks::get_bishop_attacks(sq_to_check, blockers) & bishop_queen_attackers) return true;
+        if (attacks::get_rook_attacks(sq_to_check, blockers) & rook_queen_attackers) return true;
 
         return false;
     }
