@@ -1,5 +1,4 @@
--Edit legality check for moves, utilizing instant move generation versus 'playing out' all pseudo legal moves
-  ensure compatability with en passant and pinned pieces
+-edit apply move method to avoid having to copy the position object for every move during search (extremely costly with current implementation)
 -Add magic bitboards to sliding piece logic
 -Move Trasposition table to Python file to build across moves
 -Edit method for 3 fold repetition detection
