@@ -1,6 +1,7 @@
 -edit use of apply move by adding undo move method... this will prevent having to copy position element
   could get messy so be careful
 -Add magic bitboards to sliding piece logic
+-Store moves in an array instead of a vector
 -Move Trasposition table to Python file to build across moves
 -Edit method for 3 fold repetition detection
 
