@@ -33,6 +33,26 @@
  * along a sliding piece's attack ray.
  * - `isSquareAttacked` is now overloaded to accept a custom occupancy, allowing
  * king moves to be validated as if the king is not on the board.
+ *
+ * REFACTOR 5 (Undo Move):
+ * - Replaced position copying with a make/unmake move approach for search.
+ * - Added an `Undo` struct to store information needed to reverse a move.
+ * - `applyMove` now returns an `Undo` object.
+ * - Added a new `undoMove` method to restore a position to its previous state.
+ * - `findBestMove`, `negamax`, and `perft` now use applyMove/undoMove instead
+ * of creating copies of the Position object, significantly improving performance.
+ *
+ * REFACTOR 6 (Optimized Undo):
+ * - Removed the expensive `updateOccupancies()` call from `applyMove` and `undoMove`.
+ * - Occupancy bitboards (`occWhite`, `occBlack`, `occ`) are now updated
+ * incrementally using fast XOR operations within the make/unmake functions.
+ *
+ * REFACTOR 7 (True Incremental Hashing):
+ * - Reinstated fully incremental Zobrist hash updates in `applyMove`.
+ * - Removed the expensive, full `computeAndSetHash()` call from the make/unmake cycle.
+ * - The hash is now updated with efficient XOR operations, mirroring the
+ * incremental changes to the board state, which provides the final, crucial
+ * performance boost.
  */
 
 #ifndef CHESS_ENGINE_HPP
@@ -337,7 +357,6 @@ struct Position{
 
     Position() {
         mailbox.fill(NO_PIECE);
-        // Hash computed on setup
     }
 
     void updateOccupancies(){
@@ -347,8 +366,6 @@ struct Position{
         occ = occWhite | occBlack;
     }
 
-    // **NEW**: Must be called once after setting up bitboards for a new position.
-    // `applyMove` will maintain the mailbox incrementally afterwards.
     void syncMailboxFromBitboards() {
         mailbox.fill(NO_PIECE);
         for (int piece_type = 0; piece_type < 12; ++piece_type) {
@@ -361,7 +378,6 @@ struct Position{
         }
     }
 
-    // **REFACTORED**: Now O(1) thanks to the mailbox.
     Piece piece_at(int sq) const {
         return mailbox[sq];
     }
@@ -421,6 +437,16 @@ struct Position{
     }
 };
 
+// ───────────────────────── Undo Structure ───────────────────────────
+struct Undo {
+    Move move;
+    Piece capturedPiece;
+    uint8_t castlingRights;
+    int epSquare;
+    int halfmoveClock;
+    uint64_t hash;
+};
+
 // ───────────────────────── Outcome enum ────────────────────────────
 enum class Outcome { ONGOING, CHECKMATE, STALEMATE, DRAW_FIFTY_MOVE, DRAW_THREEFOLD_REPETITION };
 
@@ -440,19 +466,22 @@ struct TranspositionTableEntry {
 class Engine{
 public:
     // Move ordering score constants
-    static const int SCORE_PV_MOVE_BONUS = 2000000; // If it's the principal variation move from TT
+    static const int SCORE_PV_MOVE_BONUS = 2000000;
     static const int SCORE_PROMOTION_TO_QUEEN = 1900000;
     static const int SCORE_PROMOTION_OTHER    = 1750000;
-    static const int SCORE_CAPTURE_BASE       = 1000000; // Base for any capture
+    static const int SCORE_CAPTURE_BASE       = 1000000;
 
     explicit Engine(int depth=6):maxDepth(depth){
-        getZobristKeys(); // Ensure keys are initialized
+        getZobristKeys();
         transposition_table.reserve(1048576);
     }
 
     Move findBestMove(Position& root_pos, const std::vector<uint64_t>& game_history_hashes){
         nodes_visited_search = 0;
-        if (root_pos.currentHash == 0) root_pos.computeAndSetHash();
+        if (root_pos.currentHash == 0) {
+            root_pos.updateOccupancies();
+            root_pos.computeAndSetHash();
+        }
         transposition_table.clear();
 
         Move overall_best_move = 0;
@@ -465,7 +494,6 @@ public:
                  return 0;
             }
 
-            // Move ordering for root moves: use best move from previous iteration
             if (overall_best_move != 0) {
                 auto it = std::find(root_moves.begin(), root_moves.end(), overall_best_move);
                 if (it != root_moves.end() && it != root_moves.begin()) {
@@ -475,18 +503,17 @@ public:
 
             Move current_iter_best_root_move = 0;
             int best_score_this_iter_at_root = -INF - 1000;
-            int alpha = -INF; // Initial alpha for root
-            int beta = INF;   // Initial beta for root
-
+            int alpha = -INF;
+            int beta = INF;
 
             for(Move m : root_moves){
-                Position child_pos = root_pos;
-                applyMove(child_pos, m);
-
                 std::vector<uint64_t> search_path_history;
                 search_path_history.push_back(root_pos.currentHash);
 
-                int score_from_opponent_pov = negamax(child_pos, current_iter_depth - 1, -beta, -alpha, search_path_history, game_history_hashes, false);
+                Undo u = applyMove(root_pos, m);
+                int score_from_opponent_pov = negamax(root_pos, current_iter_depth - 1, -beta, -alpha, search_path_history, game_history_hashes, false);
+                undoMove(root_pos, u);
+                
                 int score_from_current_player_pov = -score_from_opponent_pov;
 
                 if(score_from_current_player_pov > best_score_this_iter_at_root){
@@ -546,7 +573,10 @@ public:
     }
 
     uint64_t perft(Position& p, int depth) {
-        if (p.currentHash == 0) p.computeAndSetHash();
+        if (p.currentHash == 0) {
+             p.updateOccupancies();
+             p.computeAndSetHash();
+        }
 
         std::cout << "Starting Perft for depth " << depth << std::endl;
 
@@ -555,15 +585,14 @@ public:
 
         uint64_t total_nodes = 0;
 
-        // Sort moves alphabetically for consistent output
         std::sort(legal_moves.begin(), legal_moves.end(), [](Move a, Move b){
             return moveToString(a) < moveToString(b);
         });
 
         for (Move m : legal_moves) {
-            Position next_pos = p;
-            applyMove(next_pos, m);
-            uint64_t nodes_for_move = perft_recursive(next_pos, depth - 1);
+            Undo u = applyMove(p, m);
+            uint64_t nodes_for_move = perft_recursive(p, depth - 1);
+            undoMove(p, u);
             total_nodes += nodes_for_move;
             std::cout << moveToString(m) << ": " << nodes_for_move << std::endl;
         }
@@ -573,24 +602,10 @@ public:
     }
 
     static uint64_t getHashForPosition(const Position& p){
-        const auto& keys = getZobristKeys();
-        uint64_t h = 0;
-        for(int piece_type = 0; piece_type < 12; ++piece_type) {
-            Bitboard current_piece_bb = p.bb[piece_type];
-            while(current_piece_bb) {
-                int sq = lsb_idx(current_piece_bb);
-                h ^= keys.piece_square_keys[piece_type][sq];
-                current_piece_bb &= current_piece_bb - 1;
-            }
-        }
-        if (!p.whiteToMove) {
-            h ^= keys.black_to_move_key;
-        }
-        h ^= keys.castling_keys[p.castlingRights & 0xF];
-        if (p.epSquare != -1) {
-            h ^= keys.ep_file_keys[file_of(p.epSquare)];
-        }
-        return h;
+        Position temp = p;
+        temp.updateOccupancies();
+        temp.computeAndSetHash();
+        return temp.currentHash;
     }
 
     long getNodesVisited() const {
@@ -631,7 +646,6 @@ public:
         Bitboard pinned = 0ULL;
         std::array<Bitboard, 64> pin_ray_map{};
 
-        // Refactored Pin Detection
         const Bitboard enemy_rooks_queens = is_white ? (p.bb[B_ROOK] | p.bb[B_QUEEN]) : (p.bb[W_ROOK] | p.bb[W_QUEEN]);
         const Bitboard enemy_bishops_queens = is_white ? (p.bb[B_BISHOP] | p.bb[B_QUEEN]) : (p.bb[W_BISHOP] | p.bb[W_QUEEN]);
 
@@ -655,7 +669,6 @@ public:
             }
         }
 
-        // Generate moves for all non-king pieces, applying masks
         Piece start_p = is_white ? W_PAWN : B_PAWN;
         Piece end_p = is_white ? W_QUEEN : B_QUEEN;
 
@@ -703,9 +716,9 @@ private:
 
         uint64_t nodes = 0;
         for (Move m : legal_moves) {
-            Position next_pos = p;
-            applyMove(next_pos, m);
-            nodes += perft_recursive(next_pos, depth - 1);
+            Undo u = applyMove(p, m);
+            nodes += perft_recursive(p, depth - 1);
+            undoMove(p, u);
         }
         return nodes;
     }
@@ -851,10 +864,9 @@ private:
         Move best_move_found_this_node = 0;
 
         for (Move m : moves) {
-            Position child_pos = p;
-            applyMove(child_pos, m);
-
-            int score = -negamax(child_pos, remaining_depth - 1, -beta, -alpha, search_path_history, game_history_hashes, false);
+            Undo u = applyMove(p, m);
+            int score = -negamax(p, remaining_depth - 1, -beta, -alpha, search_path_history, game_history_hashes, false);
+            undoMove(p, u);
 
             if (score > best_score_for_node) {
                 best_score_for_node = score;
@@ -952,13 +964,8 @@ private:
 
         // 4. En Passant
         if (p.epSquare != -1) {
-            // The target square for an e.p. capture must be in the target_mask.
-            // This handles cases where the capturing pawn is pinned.
             if (target_mask & (1ULL << p.epSquare)) {
-                // Check if the pawn actually attacks the en-passant square.
                 if (attacks::pawn_attacks_table[is_white ? 0 : 1][from_sq] & (1ULL << p.epSquare)) {
-                    // This is the special case: check for a horizontal discovered attack on the king.
-                    // This happens when the king, the capturing pawn, and the captured pawn are all on the same rank.
                     int captured_pawn_sq = p.epSquare + (is_white ? -8 : 8);
                     Bitboard occupancy_without_pawns = (p.occ ^ (1ULL << from_sq) ^ (1ULL << captured_pawn_sq));
                     int king_sq = lsb_idx(p.bb[is_white ? W_KING : B_KING]);
@@ -966,7 +973,6 @@ private:
                     const Bitboard enemy_rooks_queens = is_white ? (p.bb[B_ROOK] | p.bb[B_QUEEN]) : (p.bb[W_ROOK] | p.bb[W_QUEEN]);
                     const Bitboard enemy_bishops_queens = is_white ? (p.bb[B_BISHOP] | p.bb[B_QUEEN]) : (p.bb[W_BISHOP] | p.bb[W_QUEEN]);
 
-                    // If removing both pawns does not result in the king being attacked, the move is legal.
                     if ((attacks::get_rook_attacks(king_sq, occupancy_without_pawns) & enemy_rooks_queens) == 0 &&
                         (attacks::get_bishop_attacks(king_sq, occupancy_without_pawns) & enemy_bishops_queens) == 0)
                     {
@@ -1061,7 +1067,7 @@ private:
                                           (by_white_attacker ? p.bb[W_QUEEN] : p.bb[B_QUEEN]);
         Bitboard rook_queen_attackers   = (by_white_attacker ? p.bb[W_ROOK] : p.bb[B_ROOK]) |
                                           (by_white_attacker ? p.bb[W_QUEEN] : p.bb[B_QUEEN]);
-        int color_idx = by_white_attacker ? 1 : 0; // Pawn attacks are from perspective of color being attacked
+        int color_idx = by_white_attacker ? 1 : 0;
 
         if (attacks::pawn_attacks_table[color_idx][sq_to_check] & pawn_attackers) return true;
         if (attacks::knight_attacks_table[sq_to_check] & knight_attackers) return true;
@@ -1072,147 +1078,201 @@ private:
         return false;
     }
 
-    // **REFACTORED**: Updates mailbox incrementally.
-    void applyMove(Position& p, Move m) const {
+    Undo applyMove(Position& p, Move m) {
+        const auto& keys = getZobristKeys();
+        
+        Undo u;
+        u.move = m;
+        u.castlingRights = p.castlingRights;
+        u.epSquare = p.epSquare;
+        u.halfmoveClock = p.halfmoveClock;
+        u.hash = p.currentHash;
+
         int from = fromSquare(m);
-        int to   = toSquare(m);
-        int promo_val_from_move = promotion(m);
+        int to = toSquare(m);
+        int promo_val = promotion(m);
         int flags = moveFlags(m);
 
         Piece moved_piece = p.piece_at(from);
-        Piece captured_piece_on_to_sq = p.piece_at(to); // From mailbox
-
-        if (moved_piece == NO_PIECE) { return; }
-
+        Piece captured_piece = p.piece_at(to);
+        u.capturedPiece = captured_piece;
+        
         uint64_t new_hash = p.currentHash;
-        const auto& keys = getZobristKeys();
-
-        // Update hash for pieces, castling, and ep before state changes
-        new_hash ^= keys.piece_square_keys[moved_piece][from];
-        if (captured_piece_on_to_sq != NO_PIECE) { new_hash ^= keys.piece_square_keys[captured_piece_on_to_sq][to]; }
-        if (p.epSquare != -1) { new_hash ^= keys.ep_file_keys[file_of(p.epSquare)]; }
-        new_hash ^= keys.castling_keys[p.castlingRights & 0xF];
-
-        // --- Make move on bitboards and mailbox ---
         Bitboard from_bb = 1ULL << from;
-        Bitboard to_bb   = 1ULL << to;
-        bool original_mover_was_white = p.whiteToMove;
+        Bitboard to_bb = 1ULL << to;
+        Bitboard from_to_bb = from_bb | to_bb;
 
-        // Move piece
-        p.bb[moved_piece] &= ~from_bb;
-        p.mailbox[from] = NO_PIECE;
+        bool is_white_moving = p.whiteToMove;
 
-        Piece actual_captured_piece_type = NO_PIECE;
+        // --- Update Board State and Hash Incrementally ---
+        
+        // 1. Update side-to-move hash
+        new_hash ^= keys.black_to_move_key;
 
-        if (flags & EP_FLAG) {
-            int captured_pawn_actual_sq;
-            Piece ep_captured_pawn_piece;
-            if (original_mover_was_white) {
-                captured_pawn_actual_sq = to - 8;
-                ep_captured_pawn_piece = B_PAWN;
-            } else {
-                captured_pawn_actual_sq = to + 8;
-                ep_captured_pawn_piece = W_PAWN;
-            }
-            p.bb[ep_captured_pawn_piece] &= ~(1ULL << captured_pawn_actual_sq);
-            p.mailbox[captured_pawn_actual_sq] = NO_PIECE;
-            actual_captured_piece_type = ep_captured_pawn_piece;
-            new_hash ^= keys.piece_square_keys[ep_captured_pawn_piece][captured_pawn_actual_sq];
-        } else if (captured_piece_on_to_sq != NO_PIECE) {
-            actual_captured_piece_type = captured_piece_on_to_sq;
-            p.bb[actual_captured_piece_type] &= ~to_bb;
-            // Mailbox at 'to' will be overwritten by moving piece, no extra action needed.
-        }
-
-        Piece piece_to_place_on_to_sq = moved_piece;
-
-        if (promo_val_from_move != PROMO_TYPE_NONE) {
-            Piece promoted_to_piece_enum;
-            if (original_mover_was_white) {
-                if(promo_val_from_move == PROMO_TYPE_N) promoted_to_piece_enum = W_KNIGHT;
-                else if(promo_val_from_move == PROMO_TYPE_B) promoted_to_piece_enum = W_BISHOP;
-                else if(promo_val_from_move == PROMO_TYPE_R) promoted_to_piece_enum = W_ROOK;
-                else promoted_to_piece_enum = W_QUEEN;
-            } else {
-                if(promo_val_from_move == PROMO_TYPE_N) promoted_to_piece_enum = B_KNIGHT;
-                else if(promo_val_from_move == PROMO_TYPE_B) promoted_to_piece_enum = B_BISHOP;
-                else if(promo_val_from_move == PROMO_TYPE_R) promoted_to_piece_enum = B_ROOK;
-                else promoted_to_piece_enum = B_QUEEN;
-            }
-            p.bb[promoted_to_piece_enum] |= to_bb;
-            p.mailbox[to] = promoted_to_piece_enum;
-            piece_to_place_on_to_sq = promoted_to_piece_enum;
-        } else {
-            p.bb[moved_piece] |= to_bb;
-            p.mailbox[to] = moved_piece;
-        }
-
-        new_hash ^= keys.piece_square_keys[piece_to_place_on_to_sq][to];
-
-        if (flags & KSC_FLAG) {
-            int r_from_sq = original_mover_was_white ? square(0,7) : square(7,7);
-            int r_to_sq   = original_mover_was_white ? square(0,5) : square(7,5);
-            Piece r_piece = original_mover_was_white ? W_ROOK : B_ROOK;
-            p.bb[r_piece] &= ~(1ULL << r_from_sq);
-            p.bb[r_piece] |= (1ULL << r_to_sq);
-            p.mailbox[r_from_sq] = NO_PIECE;
-            p.mailbox[r_to_sq] = r_piece;
-            new_hash ^= keys.piece_square_keys[r_piece][r_from_sq];
-            new_hash ^= keys.piece_square_keys[r_piece][r_to_sq];
-        } else if (flags & QSC_FLAG) {
-            int r_from_sq = original_mover_was_white ? square(0,0) : square(7,0);
-            int r_to_sq   = original_mover_was_white ? square(0,3) : square(7,3);
-            Piece r_piece = original_mover_was_white ? W_ROOK : B_ROOK;
-            p.bb[r_piece] &= ~(1ULL << r_from_sq);
-            p.bb[r_piece] |= (1ULL << r_to_sq);
-            p.mailbox[r_from_sq] = NO_PIECE;
-            p.mailbox[r_to_sq] = r_piece;
-            new_hash ^= keys.piece_square_keys[r_piece][r_from_sq];
-            new_hash ^= keys.piece_square_keys[r_piece][r_to_sq];
-        }
-
-        p.epSquare = -1;
-        if (flags & DPP_FLAG) {
-            p.epSquare = original_mover_was_white ? (to - 8) : (to + 8);
-        }
+        // 2. Update EP hash if an EP square exists
         if (p.epSquare != -1) {
             new_hash ^= keys.ep_file_keys[file_of(p.epSquare)];
         }
+        
+        // 3. Update castling hash
+        new_hash ^= keys.castling_keys[p.castlingRights];
 
-        // Update castling rights
-        if (moved_piece == W_KING) { p.castlingRights &= ~(Position::WK_CASTLE_MASK | Position::WQ_CASTLE_MASK); }
-        else if (moved_piece == B_KING) { p.castlingRights &= ~(Position::BK_CASTLE_MASK | Position::BQ_CASTLE_MASK); }
-        if (from == square(0,0) || to == square(0,0)) { p.castlingRights &= ~Position::WQ_CASTLE_MASK; }
-        if (from == square(0,7) || to == square(0,7)) { p.castlingRights &= ~Position::WK_CASTLE_MASK; }
-        if (from == square(7,0) || to == square(7,0)) { p.castlingRights &= ~Position::BQ_CASTLE_MASK; }
-        if (from == square(7,7) || to == square(7,7)) { p.castlingRights &= ~Position::BK_CASTLE_MASK; }
-        if (actual_captured_piece_type == W_ROOK) {
-             if (to == square(0,0)) p.castlingRights &= ~Position::WQ_CASTLE_MASK;
-             if (to == square(0,7)) p.castlingRights &= ~Position::WK_CASTLE_MASK;
+        // 4. Move the piece
+        p.bb[moved_piece] ^= from_to_bb;
+        p.mailbox[from] = NO_PIECE;
+        p.mailbox[to] = moved_piece;
+        new_hash ^= keys.piece_square_keys[moved_piece][from];
+        new_hash ^= keys.piece_square_keys[moved_piece][to];
+
+        if (is_white_moving) p.occWhite ^= from_to_bb;
+        else p.occBlack ^= from_to_bb;
+
+        // 5. Handle captures
+        if (captured_piece != NO_PIECE) {
+            p.bb[captured_piece] &= ~to_bb;
+            new_hash ^= keys.piece_square_keys[captured_piece][to];
+            if (is_white_moving) p.occBlack &= ~to_bb;
+            else p.occWhite &= ~to_bb;
         }
-        if (actual_captured_piece_type == B_ROOK) {
-             if (to == square(7,0)) p.castlingRights &= ~Position::BQ_CASTLE_MASK;
-             if (to == square(7,7)) p.castlingRights &= ~Position::BK_CASTLE_MASK;
+
+        // 6. Handle special moves
+        if (flags & EP_FLAG) {
+            int captured_pawn_sq = is_white_moving ? to - 8 : to + 8;
+            Piece ep_pawn = is_white_moving ? B_PAWN : W_PAWN;
+            p.bb[ep_pawn] &= ~(1ULL << captured_pawn_sq);
+            p.mailbox[captured_pawn_sq] = NO_PIECE;
+            new_hash ^= keys.piece_square_keys[ep_pawn][captured_pawn_sq];
+            if (is_white_moving) p.occBlack &= ~(1ULL << captured_pawn_sq);
+            else p.occWhite &= ~(1ULL << captured_pawn_sq);
+            u.capturedPiece = ep_pawn;
+        } else if (promo_val != PROMO_TYPE_NONE) {
+            Piece promoted_to;
+            if (is_white_moving) {
+                promoted_to = (promo_val == PROMO_TYPE_N) ? W_KNIGHT : (promo_val == PROMO_TYPE_B) ? W_BISHOP : (promo_val == PROMO_TYPE_R) ? W_ROOK : W_QUEEN;
+            } else {
+                promoted_to = (promo_val == PROMO_TYPE_N) ? B_KNIGHT : (promo_val == PROMO_TYPE_B) ? B_BISHOP : (promo_val == PROMO_TYPE_R) ? B_ROOK : B_QUEEN;
+            }
+            p.bb[moved_piece] &= ~to_bb; // remove pawn
+            p.bb[promoted_to] |= to_bb;  // add promoted piece
+            p.mailbox[to] = promoted_to;
+            new_hash ^= keys.piece_square_keys[moved_piece][to]; // remove pawn hash
+            new_hash ^= keys.piece_square_keys[promoted_to][to]; // add promoted piece hash
+        } else if (flags & KSC_FLAG) {
+            int r_from = is_white_moving ? 7 : 63; int r_to = is_white_moving ? 5 : 61;
+            Piece rook = is_white_moving ? W_ROOK : B_ROOK;
+            p.bb[rook] ^= ((1ULL << r_from) | (1ULL << r_to));
+            p.mailbox[r_from] = NO_PIECE; p.mailbox[r_to] = rook;
+            new_hash ^= keys.piece_square_keys[rook][r_from]; new_hash ^= keys.piece_square_keys[rook][r_to];
+            if (is_white_moving) p.occWhite ^= ((1ULL << r_from) | (1ULL << r_to));
+            else p.occBlack ^= ((1ULL << r_from) | (1ULL << r_to));
+        } else if (flags & QSC_FLAG) {
+            int r_from = is_white_moving ? 0 : 56; int r_to = is_white_moving ? 3 : 59;
+            Piece rook = is_white_moving ? W_ROOK : B_ROOK;
+            p.bb[rook] ^= ((1ULL << r_from) | (1ULL << r_to));
+            p.mailbox[r_from] = NO_PIECE; p.mailbox[r_to] = rook;
+            new_hash ^= keys.piece_square_keys[rook][r_from]; new_hash ^= keys.piece_square_keys[rook][r_to];
+            if (is_white_moving) p.occWhite ^= ((1ULL << r_from) | (1ULL << r_to));
+            else p.occBlack ^= ((1ULL << r_from) | (1ULL << r_to));
         }
-        new_hash ^= keys.castling_keys[p.castlingRights & 0xF];
 
+        // 7. Update game state
+        p.castlingRights &= ~( (from == 4 || to == 4) * (Position::WK_CASTLE_MASK | Position::WQ_CASTLE_MASK) |
+                               (from == 60 || to == 60) * (Position::BK_CASTLE_MASK | Position::BQ_CASTLE_MASK) |
+                               (from == 7 || to == 7)   * Position::WK_CASTLE_MASK |
+                               (from == 0 || to == 0)   * Position::WQ_CASTLE_MASK |
+                               (from == 63 || to == 63) * Position::BK_CASTLE_MASK |
+                               (from == 56 || to == 56) * Position::BQ_CASTLE_MASK
+                             );
 
-        if (moved_piece == W_PAWN || moved_piece == B_PAWN || actual_captured_piece_type != NO_PIECE) {
+        p.epSquare = (flags & DPP_FLAG) ? (is_white_moving ? to - 8 : to + 8) : -1;
+        
+        if (moved_piece == W_PAWN || moved_piece == B_PAWN || captured_piece != NO_PIECE) {
             p.halfmoveClock = 0;
         } else {
             p.halfmoveClock++;
         }
+        if (!is_white_moving) p.fullmoveNumber++;
+        p.whiteToMove = !is_white_moving;
+        
+        // 8. Finalize Hash and Occupancy
+        new_hash ^= keys.castling_keys[p.castlingRights];
+        if (p.epSquare != -1) {
+            new_hash ^= keys.ep_file_keys[file_of(p.epSquare)];
+        }
+        p.currentHash = new_hash;
+        p.occ = p.occWhite | p.occBlack;
 
-        if (!original_mover_was_white) {
-            p.fullmoveNumber++;
+        return u;
+    }
+
+    void undoMove(Position& p, const Undo& u) {
+        // --- Restore all state directly from the Undo object ---
+        p.castlingRights = u.castlingRights;
+        p.epSquare       = u.epSquare;
+        p.halfmoveClock  = u.halfmoveClock;
+        p.currentHash    = u.hash;
+        p.whiteToMove    = !p.whiteToMove; // Revert turn
+
+        if (p.whiteToMove) {
+            if (p.fullmoveNumber > 1) p.fullmoveNumber--;
         }
 
-        p.whiteToMove = !original_mover_was_white;
-        new_hash ^= keys.black_to_move_key;
+        Move m = u.move;
+        int from = fromSquare(m);
+        int to = toSquare(m);
+        int flags = moveFlags(m);
+        int promo_val = promotion(m);
 
-        p.updateOccupancies();
-        p.currentHash = new_hash;
+        Piece moved_piece = p.piece_at(to);
+        bool is_white_undone = p.whiteToMove;
+        
+        // --- Undo board state changes ---
+        if (promo_val != PROMO_TYPE_NONE) {
+            Piece pawn = is_white_undone ? W_PAWN : B_PAWN;
+            p.bb[moved_piece] &= ~(1ULL << to); // remove promoted piece
+            p.bb[pawn] |= (1ULL << to); // add pawn back
+            moved_piece = pawn;
+        }
+
+        Bitboard from_to_bb = (1ULL << from) | (1ULL << to);
+        p.bb[moved_piece] ^= from_to_bb;
+        p.mailbox[from] = moved_piece;
+        p.mailbox[to] = u.capturedPiece;
+
+        if (is_white_undone) p.occWhite ^= from_to_bb;
+        else p.occBlack ^= from_to_bb;
+
+        if (u.capturedPiece != NO_PIECE) {
+            int captured_sq = to;
+            if (flags & EP_FLAG) {
+                captured_sq = is_white_undone ? to - 8 : to + 8;
+            }
+            p.bb[u.capturedPiece] |= (1ULL << captured_sq);
+            p.mailbox[captured_sq] = u.capturedPiece;
+            if (is_white_undone) p.occBlack |= (1ULL << captured_sq);
+            else p.occWhite |= (1ULL << captured_sq);
+        }
+
+        if (flags & KSC_FLAG || flags & QSC_FLAG) {
+            int r_from, r_to;
+            Piece rook_piece;
+            if (flags & KSC_FLAG) {
+                r_from = is_white_undone ? 5 : 61; r_to = is_white_undone ? 7 : 63;
+            } else { // QSC
+                r_from = is_white_undone ? 3 : 59; r_to = is_white_undone ? 0 : 56;
+            }
+            rook_piece = is_white_undone ? W_ROOK : B_ROOK;
+            Bitboard rook_move_bb = (1ULL << r_from) | (1ULL << r_to);
+            p.bb[rook_piece] ^= rook_move_bb;
+            p.mailbox[r_from] = NO_PIECE;
+            p.mailbox[r_to] = rook_piece;
+            if (is_white_undone) p.occWhite ^= rook_move_bb;
+            else p.occBlack ^= rook_move_bb;
+        }
+        
+        p.occ = p.occWhite | p.occBlack;
     }
+
 
 }; // End of Engine class
 
