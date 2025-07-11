@@ -228,7 +228,7 @@ def decode_cpp_move_to_js(cpp_move_int, player_who_moved_color):
     }
 
 # Store engine and its depth globally
-ENGINE_SEARCH_DEPTH = 8 # Example depth
+ENGINE_SEARCH_DEPTH = 6
 engine = None
 try:
     engine = chesscore.Engine(ENGINE_SEARCH_DEPTH)
