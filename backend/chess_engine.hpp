@@ -774,133 +774,168 @@ private:
     }
 
     int negamax(Position& p, int remaining_depth, int alpha, int beta,
-                std::vector<uint64_t>& search_path_history,
-                const std::vector<uint64_t>& game_history_hashes, bool isRootNode = false ) {
+            std::vector<uint64_t>& search_path_history,
+            const std::vector<uint64_t>& game_history_hashes, bool isRootNode = false) {
 
-        int original_alpha = alpha;
-        nodes_visited_search++;
+    int original_alpha = alpha;
+    nodes_visited_search++;
 
-        for (uint64_t historical_hash_in_path : search_path_history) {
-            if (historical_hash_in_path == p.currentHash) {
-                return 0; // Draw by repetition in current search path
+    // --- Repetition Checks ---
+    for (uint64_t historical_hash_in_path : search_path_history) {
+        if (historical_hash_in_path == p.currentHash) {
+            return 0; // Draw by repetition in current search path
+        }
+    }
+
+    int game_history_repetitions = 0;
+    for (uint64_t historical_game_hash : game_history_hashes) {
+        if (historical_game_hash == p.currentHash) {
+            game_history_repetitions++;
+        }
+    }
+    if (game_history_repetitions >= 2) {
+        return 0; // Draw by threefold repetition including game history
+    }
+
+    // --- Transposition Table Lookup ---
+    Move tt_best_move_for_this_node = 0;
+    if (p.currentHash != 0) {
+        auto tt_entry_it = transposition_table.find(p.currentHash);
+        if (tt_entry_it != transposition_table.end()) {
+            const TranspositionTableEntry& entry = tt_entry_it->second;
+            if (entry.depth >= remaining_depth) {
+                if (entry.type == TTEntryType::EXACT) return entry.score;
+                if (entry.type == TTEntryType::LOWER_BOUND && entry.score >= beta) return entry.score;
+                if (entry.type == TTEntryType::UPPER_BOUND && entry.score <= alpha) return entry.score;
             }
+            tt_best_move_for_this_node = entry.bestMove;
+        }
+    }
+
+    // --- Base Case: Leaf Node ---
+    if (remaining_depth <= 0) {
+        int eval = evaluateMaterial(p); // Replace with a more complex evaluation
+        return p.whiteToMove ? eval : -eval;
+    }
+
+    // --- Move Generation ---
+    std::vector<Move> moves;
+    generateMoves(p, moves);
+
+    // --- Base Case: No Legal Moves (Checkmate or Stalemate) ---
+    if (moves.empty()) {
+        int king_piece_idx = p.whiteToMove ? W_KING : B_KING;
+        int king_sq = lsb_idx(p.bb[king_piece_idx]);
+        if (isSquareAttacked(p, king_sq, !p.whiteToMove)) {
+            return -INF + (this->maxDepth - remaining_depth); // Checkmate
+        }
+        return 0; // Stalemate
+    }
+
+    // --- Move Ordering ---
+    // 1. Prioritize the TT move by swapping it to the front.
+    size_t sort_start_index = 0;
+    if (tt_best_move_for_this_node != 0) {
+        auto it = std::find(moves.begin(), moves.end(), tt_best_move_for_this_node);
+        if (it != moves.end()) {
+            std::iter_swap(moves.begin(), it);
+            sort_start_index = 1; // The rest of the moves start from index 1
+        }
+    }
+
+    // Only sort if there are moves remaining after the potential TT move.
+    if (moves.size() > sort_start_index) {
+        // 2. Score the remaining moves ONCE to avoid repeated calculations.
+        std::vector<std::pair<int, Move>> scored_moves;
+        scored_moves.reserve(moves.size() - sort_start_index);
+        for (size_t i = sort_start_index; i < moves.size(); ++i) {
+            scored_moves.emplace_back(scoreMove(p, moves[i]), moves[i]);
         }
 
-        int game_history_repetitions = 0;
-        for (uint64_t historical_game_hash : game_history_hashes) {
-            if (historical_game_hash == p.currentHash) {
-                game_history_repetitions++;
-            }
-        }
-        if (game_history_repetitions >= 2) {
-            return 0; // Draw by threefold repetition including game history
-        }
+        // 3. Find and sort the top N moves from the scored list.
+        const size_t num_moves_to_sort = 5; // A reasonable number to sort
+        const size_t top_n_boundary = std::min(scored_moves.size(), num_moves_to_sort);
 
-        // TT Lookup
-        Move tt_best_move_for_this_node = 0;
-        if (p.currentHash != 0) {
-            auto tt_entry_it = transposition_table.find(p.currentHash);
-            if (tt_entry_it != transposition_table.end()) {
-                const TranspositionTableEntry& entry = tt_entry_it->second;
-                if (entry.depth >= remaining_depth) {
-                    if (entry.type == TTEntryType::EXACT) return entry.score;
-                    if (entry.type == TTEntryType::LOWER_BOUND && entry.score >= beta) return entry.score;
-                    if (entry.type == TTEntryType::UPPER_BOUND && entry.score <= alpha) return entry.score;
-                }
-                tt_best_move_for_this_node = entry.bestMove;
-            }
-        }
+        if (top_n_boundary > 0) {
+            // A. Partition the list to bring the top N moves to the front (O(N)).
+            std::nth_element(
+                scored_moves.begin(),
+                scored_moves.begin() + top_n_boundary - 1,
+                scored_moves.end(),
+                [](const auto& a, const auto& b) { return a.first > b.first; }
+            );
 
-        // At leaf node of search or in quiescence search, we would return evaluation
-        if (remaining_depth <= 0) {
-            int eval = evaluateMaterial(p);
-            return p.whiteToMove ? eval : -eval;
-        }
-
-        std::vector<Move> moves;
-        generateMoves(p, moves);
-
-        if (moves.empty()) {
-            int king_piece_idx = p.whiteToMove ? W_KING : B_KING;
-            int king_sq = lsb_idx(p.bb[king_piece_idx]);
-            if (isSquareAttacked(p, king_sq, !p.whiteToMove)) {
-                return -INF + (this->maxDepth - remaining_depth); // Checkmate
-            }
-            return 0; // Stalemate
-        }
-
-        // Move Ordering
-        if (tt_best_move_for_this_node != 0) {
-            auto it = std::find(moves.begin(), moves.end(), tt_best_move_for_this_node);
-            if (it != moves.end() && it != moves.begin()) {
-                std::rotate(moves.begin(), it, it + 1);
-            }
-        }
-        size_t sort_start_index = (tt_best_move_for_this_node != 0 && !moves.empty() && moves[0] == tt_best_move_for_this_node) ? 1 : 0;
-        if (moves.size() > sort_start_index + 1) {
-            std::sort(moves.begin() + sort_start_index, moves.end(),
-                [&](Move a, Move b) {
-                    return scoreMove(p, a) > scoreMove(p, b);
-                }
+            // B. Sort only those top N moves (O(K log K)).
+            std::sort(
+                scored_moves.begin(),
+                scored_moves.begin() + top_n_boundary,
+                [](const auto& a, const auto& b) { return a.first > b.first; }
             );
         }
-
-        search_path_history.push_back(p.currentHash);
-
-        int best_score_for_node = -INF - 1000;
-        Move best_move_found_this_node = 0;
-
-        for (Move m : moves) {
-            Position child_pos = p;
-            applyMove(child_pos, m);
-
-            int score = -negamax(child_pos, remaining_depth - 1, -beta, -alpha, search_path_history, game_history_hashes, false);
-
-            if (score > best_score_for_node) {
-                best_score_for_node = score;
-                best_move_found_this_node = m;
-            }
-            if (score > alpha) {
-                alpha = score;
-            }
-            if (alpha >= beta) { // Beta-cutoff
-                search_path_history.pop_back();
-                if (p.currentHash != 0) {
-                    TranspositionTableEntry new_entry;
-                    new_entry.zobristHash = p.currentHash;
-                    new_entry.depth = remaining_depth;
-                    new_entry.score = best_score_for_node;
-                    new_entry.bestMove = best_move_found_this_node;
-                    new_entry.type = TTEntryType::LOWER_BOUND;
-                    auto existing_entry_it = transposition_table.find(p.currentHash);
-                    if (existing_entry_it == transposition_table.end() || remaining_depth >= existing_entry_it->second.depth) {
-                        transposition_table[p.currentHash] = new_entry;
-                    }
-                }
-                return alpha;
-            }
+        
+        // 4. Place the re-ordered moves back into the original vector.
+        for (size_t i = 0; i < scored_moves.size(); ++i) {
+            moves[sort_start_index + i] = scored_moves[i].second;
         }
-        search_path_history.pop_back();
-
-        // Store result in TT
-        if (p.currentHash != 0) {
-            TranspositionTableEntry new_entry;
-            new_entry.zobristHash = p.currentHash;
-            new_entry.depth = remaining_depth;
-            new_entry.score = best_score_for_node;
-            new_entry.bestMove = best_move_found_this_node;
-            if (best_score_for_node <= original_alpha) {
-                new_entry.type = TTEntryType::UPPER_BOUND;
-            } else {
-                new_entry.type = TTEntryType::EXACT;
-            }
-             auto existing_entry_it = transposition_table.find(p.currentHash);
-            if (existing_entry_it == transposition_table.end() || remaining_depth >= existing_entry_it->second.depth) {
-                transposition_table[p.currentHash] = new_entry;
-            }
-        }
-        return best_score_for_node;
     }
+    
+    // --- Negamax Search ---
+    search_path_history.push_back(p.currentHash);
+
+    int best_score_for_node = -INF - 1000;
+    Move best_move_found_this_node = 0;
+
+    for (Move m : moves) {
+        Position child_pos = p;
+        applyMove(child_pos, m);
+
+        int score = -negamax(child_pos, remaining_depth - 1, -beta, -alpha, search_path_history, game_history_hashes, false);
+
+        if (score > best_score_for_node) {
+            best_score_for_node = score;
+            best_move_found_this_node = m;
+        }
+        if (score > alpha) {
+            alpha = score;
+        }
+        if (alpha >= beta) { // Beta-cutoff
+            search_path_history.pop_back();
+            if (p.currentHash != 0) {
+                TranspositionTableEntry new_entry;
+                new_entry.zobristHash = p.currentHash;
+                new_entry.depth = remaining_depth;
+                new_entry.score = best_score_for_node;
+                new_entry.bestMove = best_move_found_this_node;
+                new_entry.type = TTEntryType::LOWER_BOUND;
+                auto existing_entry_it = transposition_table.find(p.currentHash);
+                if (existing_entry_it == transposition_table.end() || remaining_depth >= existing_entry_it->second.depth) {
+                    transposition_table[p.currentHash] = new_entry;
+                }
+            }
+            return alpha;
+        }
+    }
+    search_path_history.pop_back();
+
+    // --- Store Result in Transposition Table ---
+    if (p.currentHash != 0) {
+        TranspositionTableEntry new_entry;
+        new_entry.zobristHash = p.currentHash;
+        new_entry.depth = remaining_depth;
+        new_entry.score = best_score_for_node;
+        new_entry.bestMove = best_move_found_this_node;
+        if (best_score_for_node <= original_alpha) {
+            new_entry.type = TTEntryType::UPPER_BOUND;
+        } else {
+            new_entry.type = TTEntryType::EXACT;
+        }
+        auto existing_entry_it = transposition_table.find(p.currentHash);
+        if (existing_entry_it == transposition_table.end() || remaining_depth >= existing_entry_it->second.depth) {
+            transposition_table[p.currentHash] = new_entry;
+        }
+    }
+    return best_score_for_node;
+}
 
     void add_pawn_moves(const Position& p, int from_sq, std::vector<Move>& moves, Bitboard target_mask) const {
         const bool is_white = p.whiteToMove;
