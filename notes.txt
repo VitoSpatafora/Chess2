@@ -10,3 +10,7 @@ add premove to UI
 
 
 g++ -O3 -Wall -shared -std=c++17 -fPIC -DDEBUG_BOARD `python3 -m pybind11 --includes` binding.cpp -o chesscore`python3-config --extension-suffix`
+
+
+eval "$(ssh-agent -s)"
+ssh-add ~/.ssh/id_ed25519
