@@ -1,9 +1,12 @@
--edit use of apply move by adding undo move method... this will prevent having to copy position element
-  could get messy so be careful
+-edit move ordering to implement a min heap of the top n moves
+  -during the loop through all the moves, if heap is not full or the current move has a higher score than the lowest move in heap, pop the move in the list and add it back into unsorted list (idk if you can edit while iterating... might cause issues)(maybe use a seperate list for unsorted moves to keep it clean)
+  -add the current move to the heap
+  -Once out of the loop, insert moves from the heap into the sorted list by looping downward starting at index[n-1] or index[n] depending on if there is a TT move at index 0
+  -finish ordered moves list by adding in the rest of the unsorted moves
+
+
 -Add magic bitboards to sliding piece logic
--Store moves in an array instead of a vector
--Move Trasposition table to Python file to build across moves
--Edit method for 3 fold repetition detection
+
 
 
 add premove to UI
