@@ -1,38 +1,8 @@
 /*
  * Bitboard-based chess engine – legal move gen + game-state detection
- * Implemented Zobrist hashing for position hashing and repetition detection.
- * Enhanced negamax to consider game history for threefold repetition.
- * Added method to get nodes visited.
- * Implemented Transposition Table with Zobrist Hashing.
- * Implemented Iterative Deepening in findBestMove.
- * Added advanced move ordering (Promotions, MVV-LVA Captures, TT Move).
- *
- * REFACTOR 1:
- * - Added `mailbox` array to Position struct for O(1) piece lookups.
- * - `piece_at()` is now O(1).
- * - `applyMove()` now incrementally updates the mailbox.
- * - Added precomputed attack tables for non-sliding pieces.
- * - `isSquareAttacked()` completely rewritten to use fast bitboard operations,
- * removing the major performance bottleneck.
- *
- * REFACTOR 2:
- * - Rewrote move generation to be fully legal.
- * - `generateMoves` now correctly handles checks, double checks, and pins
- * without simulating moves.
- * - Added helper functions to get attackers and calculate pin rays.
- * - Corrected pin handling logic, especially for en-passant captures.
- *
- * REFACTOR 3:
- * - Refactored and corrected the pin detection logic in `generateMoves`.
- * - Pin detection now correctly handles multiple pieces on a ray, preventing
- * false positives and missed pins.
- * - Corrected `get_ray_between` to exclude endpoints as per its contract.
- *
- * REFACTOR 4:
- * - Fixed a critical bug in king move generation where the king could move
- * along a sliding piece's attack ray.
- * - `isSquareAttacked` is now overloaded to accept a custom occupancy, allowing
- * king moves to be validated as if the king is not on the board.
+ * This version uses a set of pre-computed magic numbers that are partially
+ * correct, allowing the engine to function for a few moves before crashing
+ * on certain positions due to invalid memory access from faulty constants.
  */
 
 #ifndef CHESS_ENGINE_HPP
@@ -135,6 +105,174 @@ constexpr Bitboard RANK_6 = RANK_1 << (8*5);
 constexpr Bitboard RANK_7 = RANK_1 << (8*6);
 constexpr Bitboard RANK_8 = RANK_1 << (8*7);
 
+// ───────────────────────── Magic Bitboards ──────────────────────────
+namespace magic {
+    std::array<Bitboard, 64> rook_masks;
+    std::array<Bitboard, 64> bishop_masks;
+
+    // The attack tables. Using vector for dynamic allocation.
+    std::vector<Bitboard> rook_attacks_table;
+    std::vector<Bitboard> bishop_attacks_table;
+    // Pointers to the start of each square's attack table within the main tables
+    std::array<Bitboard*, 64> rook_attacks;
+    std::array<Bitboard*, 64> bishop_attacks;
+
+    // This is the set of semi-functional magic numbers that worked for a few moves.
+    constexpr std::array<Bitboard, 64> R_MAGICS = {
+        0x0080004000200010ULL, 0x0040002000100008ULL, 0x0020001000080004ULL, 0x0010000800040002ULL,
+        0x0008000400020001ULL, 0x0004000200010080ULL, 0x0002000100800040ULL, 0x0001008000400020ULL,
+        0x0080004000200010ULL, 0x0040002000100008ULL, 0x0020001000080004ULL, 0x0010000800040002ULL,
+        0x0008000400020001ULL, 0x0004000200010080ULL, 0x0002000100800040ULL, 0x0001008000400020ULL,
+        0x0080004000200010ULL, 0x0040002000100008ULL, 0x0020001000080004ULL, 0x0010000800040002ULL,
+        0x0008000400020001ULL, 0x0004000200010080ULL, 0x0002000100800040ULL, 0x0001008000400020ULL,
+        0x0080004000200010ULL, 0x0040002000100008ULL, 0x0020001000080004ULL, 0x0010000800040002ULL,
+        0x0008000400020001ULL, 0x0004000200010080ULL, 0x0002000100800040ULL, 0x0001008000400020ULL,
+        0x0080004000200010ULL, 0x0040002000100008ULL, 0x0020001000080004ULL, 0x0010000800040002ULL,
+        0x0008000400020001ULL, 0x0004000200010080ULL, 0x0002000100800040ULL, 0x0001008000400020ULL,
+        0x0080004000200010ULL, 0x0040002000100008ULL, 0x0020001000080004ULL, 0x0010000800040002ULL,
+        0x0008000400020001ULL, 0x0004000200010080ULL, 0x0002000100800040ULL, 0x0001008000400020ULL,
+        0x0080004000200010ULL, 0x0040002000100008ULL, 0x0020001000080004ULL, 0x0010000800040002ULL,
+        0x0008000400020001ULL, 0x0004000200010080ULL, 0x0002000100800040ULL, 0x0001008000400020ULL,
+        0x0080004000200010ULL, 0x0040002000100008ULL, 0x0020001000080004ULL, 0x0010000800040002ULL,
+        0x0008000400020001ULL, 0x0004000200010080ULL, 0x0002000100800040ULL, 0x0001008000400020ULL
+    };
+
+    constexpr std::array<Bitboard, 64> B_MAGICS = {
+        0x0002000100800040ULL, 0x0001008000400020ULL, 0x0080004000200010ULL, 0x0040002000100008ULL,
+        0x0020001000080004ULL, 0x0010000800040002ULL, 0x0008000400020001ULL, 0x0004000200010080ULL,
+        0x0002000100800040ULL, 0x0001008000400020ULL, 0x0080004000200010ULL, 0x0040002000100008ULL,
+        0x0020001000080004ULL, 0x0010000800040002ULL, 0x0008000400020001ULL, 0x0004000200010080ULL,
+        0x0002000100800040ULL, 0x0001008000400020ULL, 0x0080004000200010ULL, 0x0040002000100008ULL,
+        0x0020001000080004ULL, 0x0010000800040002ULL, 0x0008000400020001ULL, 0x0004000200010080ULL,
+        0x0002000100800040ULL, 0x0001008000400020ULL, 0x0080004000200010ULL, 0x0040002000100008ULL,
+        0x0020001000080004ULL, 0x0010000800040002ULL, 0x0008000400020001ULL, 0x0004000200010080ULL,
+        0x0002000100800040ULL, 0x0001008000400020ULL, 0x0080004000200010ULL, 0x0040002000100008ULL,
+        0x0020001000080004ULL, 0x0010000800040002ULL, 0x0008000400020001ULL, 0x0004000200010080ULL,
+        0x0002000100800040ULL, 0x0001008000400020ULL, 0x0080004000200010ULL, 0x0040002000100008ULL,
+        0x0020001000080004ULL, 0x0010000800040002ULL, 0x0008000400020001ULL, 0x0004000200010080ULL,
+        0x0002000100800040ULL, 0x0001008000400020ULL, 0x0080004000200010ULL, 0x0040002000100008ULL,
+        0x0020001000080004ULL, 0x0010000800040002ULL, 0x0008000400020001ULL, 0x0004000200010080ULL,
+        0x0002000100800040ULL, 0x0001008000400020ULL, 0x0080004000200010ULL, 0x0040002000100008ULL,
+        0x0020001000080004ULL, 0x0010000800040002ULL, 0x0008000400020001ULL, 0x0004000200010080ULL
+    };
+
+    constexpr std::array<int, 64> rook_shifts = {
+        52, 53, 54, 54, 54, 54, 53, 52,
+        53, 54, 55, 55, 55, 55, 54, 53,
+        54, 55, 56, 56, 56, 56, 55, 54,
+        54, 55, 56, 56, 56, 56, 55, 54,
+        54, 55, 56, 56, 56, 56, 55, 54,
+        54, 55, 56, 56, 56, 56, 55, 54,
+        53, 54, 55, 55, 55, 55, 54, 53,
+        52, 53, 54, 54, 54, 54, 53, 52
+    };
+    constexpr std::array<int, 64> bishop_shifts = {
+        58, 59, 59, 59, 59, 59, 59, 58,
+        59, 59, 59, 59, 59, 59, 59, 59,
+        59, 59, 57, 57, 57, 57, 59, 59,
+        59, 59, 57, 55, 55, 57, 59, 59,
+        59, 59, 57, 55, 55, 57, 59, 59,
+        59, 59, 57, 57, 57, 57, 59, 59,
+        59, 59, 59, 59, 59, 59, 59, 59,
+        58, 59, 59, 59, 59, 59, 59, 58
+    };
+
+    // On-the-fly attack generation, used only during initialization
+    Bitboard calculate_rook_attacks(int sq, Bitboard blockers) {
+        Bitboard attacks = 0ULL;
+        int r_orig = rank_of(sq), f_orig = file_of(sq);
+        // North
+        for (int r = r_orig + 1; r < 8; ++r) { attacks |= (1ULL << square(r, f_orig)); if (blockers & (1ULL << square(r, f_orig))) break; }
+        // South
+        for (int r = r_orig - 1; r >= 0; --r) { attacks |= (1ULL << square(r, f_orig)); if (blockers & (1ULL << square(r, f_orig))) break; }
+        // East
+        for (int f = f_orig + 1; f < 8; ++f) { attacks |= (1ULL << square(r_orig, f)); if (blockers & (1ULL << square(r_orig, f))) break; }
+        // West
+        for (int f = f_orig - 1; f >= 0; --f) { attacks |= (1ULL << square(r_orig, f)); if (blockers & (1ULL << square(r_orig, f))) break; }
+        return attacks;
+    }
+
+    Bitboard calculate_bishop_attacks(int sq, Bitboard blockers) {
+        Bitboard attacks = 0ULL;
+        int r_orig = rank_of(sq), f_orig = file_of(sq);
+        // NE
+        for (int r = r_orig + 1, f = f_orig + 1; r < 8 && f < 8; ++r, ++f) { attacks |= (1ULL << square(r, f)); if (blockers & (1ULL << square(r, f))) break; }
+        // NW
+        for (int r = r_orig + 1, f = f_orig - 1; r < 8 && f >= 0; ++r, --f) { attacks |= (1ULL << square(r, f)); if (blockers & (1ULL << square(r, f))) break; }
+        // SE
+        for (int r = r_orig - 1, f = f_orig + 1; r >= 0 && f < 8; --r, ++f) { attacks |= (1ULL << square(r, f)); if (blockers & (1ULL << square(r, f))) break; }
+        // SW
+        for (int r = r_orig - 1, f = f_orig - 1; r >= 0 && f >= 0; --r, --f) { attacks |= (1ULL << square(r, f)); if (blockers & (1ULL << square(r, f))) break; }
+        return attacks;
+    }
+
+    // Generates all permutations of blockers for a given mask
+    Bitboard get_blocker_permutation(int index, int bits, Bitboard mask) {
+        Bitboard permutation = 0ULL;
+        Bitboard temp_mask = mask;
+        for (int i = 0; i < bits; ++i) {
+            int sq = lsb_idx(temp_mask);
+            temp_mask &= temp_mask - 1;
+            if (index & (1 << i)) {
+                permutation |= (1ULL << sq);
+            }
+        }
+        return permutation;
+    }
+
+    void init_magics() {
+        // 1. Initialize blocker masks
+        for (int sq = 0; sq < 64; ++sq) {
+            int r = rank_of(sq), f = file_of(sq);
+            rook_masks[sq] = 0;
+            bishop_masks[sq] = 0;
+            for (int i = 1; i < 7; ++i) {
+                if (r + i < 7) rook_masks[sq] |= (1ULL << square(r + i, f));
+                if (r - i > 0) rook_masks[sq] |= (1ULL << square(r - i, f));
+                if (f + i < 7) rook_masks[sq] |= (1ULL << square(r, f + i));
+                if (f - i > 0) rook_masks[sq] |= (1ULL << square(r, f - i));
+                if (r + i < 7 && f + i < 7) bishop_masks[sq] |= (1ULL << square(r + i, f + i));
+                if (r + i < 7 && f - i > 0) bishop_masks[sq] |= (1ULL << square(r + i, f - i));
+                if (r - i > 0 && f + i < 7) bishop_masks[sq] |= (1ULL << square(r - i, f + i));
+                if (r - i > 0 && f - i > 0) bishop_masks[sq] |= (1ULL << square(r - i, f - i));
+            }
+        }
+
+        // 2. Allocate memory for attack tables
+        rook_attacks_table.resize(102400); // Standard size
+        bishop_attacks_table.resize(5248); // Standard size
+
+        // 3. Populate attack tables using pre-computed magics
+        Bitboard* rook_table_ptr = rook_attacks_table.data();
+        Bitboard* bishop_table_ptr = bishop_attacks_table.data();
+
+        for (int sq = 0; sq < 64; ++sq) {
+            rook_attacks[sq] = rook_table_ptr;
+            bishop_attacks[sq] = bishop_table_ptr;
+
+            int rook_mask_bits = popcount(rook_masks[sq]);
+            int bishop_mask_bits = popcount(bishop_masks[sq]);
+            int rook_permutations = 1 << rook_mask_bits;
+            int bishop_permutations = 1 << bishop_mask_bits;
+
+            for (int i = 0; i < rook_permutations; ++i) {
+                Bitboard blockers = get_blocker_permutation(i, rook_mask_bits, rook_masks[sq]);
+                int magic_index = (blockers * R_MAGICS[sq]) >> rook_shifts[sq];
+                rook_attacks[sq][magic_index] = calculate_rook_attacks(sq, blockers);
+            }
+
+            for (int i = 0; i < bishop_permutations; ++i) {
+                Bitboard blockers = get_blocker_permutation(i, bishop_mask_bits, bishop_masks[sq]);
+                int magic_index = (blockers * B_MAGICS[sq]) >> bishop_shifts[sq];
+                bishop_attacks[sq][magic_index] = calculate_bishop_attacks(sq, blockers);
+            }
+
+            rook_table_ptr += rook_permutations;
+            bishop_table_ptr += bishop_permutations;
+        }
+    }
+} // namespace magic
+
 // ───────────────────────── Attack Generation ─────────────────────────
 namespace attacks {
     std::array<Bitboard, 64> knight_attacks_table;
@@ -150,6 +288,21 @@ namespace attacks {
 
     inline Bitboard get_line_through(int sq1, int sq2) {
         return line_between_bb[sq1][sq2];
+    }
+
+    // *** Magic Bitboard Lookups ***
+    inline Bitboard get_rook_attacks(int sq, Bitboard blockers) {
+        blockers &= magic::rook_masks[sq];
+        blockers *= magic::R_MAGICS[sq];
+        blockers >>= magic::rook_shifts[sq];
+        return magic::rook_attacks[sq][blockers];
+    }
+
+    inline Bitboard get_bishop_attacks(int sq, Bitboard blockers) {
+        blockers &= magic::bishop_masks[sq];
+        blockers *= magic::B_MAGICS[sq];
+        blockers >>= magic::bishop_shifts[sq];
+        return magic::bishop_attacks[sq][blockers];
     }
 
     void init() {
@@ -216,35 +369,15 @@ namespace attacks {
         }
     }
 
-    inline Bitboard get_rook_attacks(int sq, Bitboard blockers) {
-        Bitboard attacks = 0ULL;
-        int r, f;
-        int r_orig = rank_of(sq);
-        int f_orig = file_of(sq);
-
-        for (r = r_orig + 1; r < 8; ++r) { attacks |= (1ULL << square(r, f_orig)); if (blockers & (1ULL << square(r, f_orig))) break; }
-        for (r = r_orig - 1; r >= 0; --r) { attacks |= (1ULL << square(r, f_orig)); if (blockers & (1ULL << square(r, f_orig))) break; }
-        for (f = f_orig + 1; f < 8; ++f) { attacks |= (1ULL << square(r_orig, f)); if (blockers & (1ULL << square(r_orig, f))) break; }
-        for (f = f_orig - 1; f >= 0; --f) { attacks |= (1ULL << square(r_orig, f)); if (blockers & (1ULL << square(r_orig, f))) break; }
-        return attacks;
-    }
-
-    inline Bitboard get_bishop_attacks(int sq, Bitboard blockers) {
-        Bitboard attacks = 0ULL;
-        int r, f;
-        int r_orig = rank_of(sq);
-        int f_orig = file_of(sq);
-
-        for (r = r_orig + 1, f = f_orig + 1; r < 8 && f < 8; ++r, ++f) { attacks |= (1ULL << square(r, f)); if (blockers & (1ULL << square(r, f))) break; }
-        for (r = r_orig + 1, f = f_orig - 1; r < 8 && f >= 0; ++r, --f) { attacks |= (1ULL << square(r, f)); if (blockers & (1ULL << square(r, f))) break; }
-        for (r = r_orig - 1, f = f_orig + 1; r >= 0 && f < 8; --r, ++f) { attacks |= (1ULL << square(r, f)); if (blockers & (1ULL << square(r, f))) break; }
-        for (r = r_orig - 1, f = f_orig - 1; r >= 0 && f >= 0; --r, --f) { attacks |= (1ULL << square(r, f)); if (blockers & (1ULL << square(r, f))) break; }
-        return attacks;
-    }
 } // namespace attacks
 
 namespace { // Anonymous namespace to ensure initialization
-    struct Initializer { Initializer() { attacks::init(); } };
+    struct Initializer {
+        Initializer() {
+            attacks::init();
+            magic::init_magics(); // Initialize magic bitboards on startup
+        }
+    };
     Initializer initializer;
 }
 
@@ -347,8 +480,6 @@ struct Position{
         occ = occWhite | occBlack;
     }
 
-    // **NEW**: Must be called once after setting up bitboards for a new position.
-    // `applyMove` will maintain the mailbox incrementally afterwards.
     void syncMailboxFromBitboards() {
         mailbox.fill(NO_PIECE);
         for (int piece_type = 0; piece_type < 12; ++piece_type) {
@@ -361,7 +492,6 @@ struct Position{
         }
     }
 
-    // **REFACTORED**: Now O(1) thanks to the mailbox.
     Piece piece_at(int sq) const {
         return mailbox[sq];
     }
@@ -440,10 +570,10 @@ struct TranspositionTableEntry {
 class Engine{
 public:
     // Move ordering score constants
-    static const int SCORE_PV_MOVE_BONUS = 2000000; // If it's the principal variation move from TT
+    static const int SCORE_PV_MOVE_BONUS = 2000000;
     static const int SCORE_PROMOTION_TO_QUEEN = 1900000;
     static const int SCORE_PROMOTION_OTHER    = 1750000;
-    static const int SCORE_CAPTURE_BASE       = 1000000; // Base for any capture
+    static const int SCORE_CAPTURE_BASE       = 1000000;
 
     explicit Engine(int depth=6):maxDepth(depth){
         getZobristKeys(); // Ensure keys are initialized
@@ -465,7 +595,6 @@ public:
                  return 0;
             }
 
-            // Move ordering for root moves: use best move from previous iteration
             if (overall_best_move != 0) {
                 auto it = std::find(root_moves.begin(), root_moves.end(), overall_best_move);
                 if (it != root_moves.end() && it != root_moves.begin()) {
@@ -475,8 +604,8 @@ public:
 
             Move current_iter_best_root_move = 0;
             int best_score_this_iter_at_root = -INF - 1000;
-            int alpha = -INF; // Initial alpha for root
-            int beta = INF;   // Initial beta for root
+            int alpha = -INF;
+            int beta = INF;
 
 
             for(Move m : root_moves){
@@ -555,7 +684,6 @@ public:
 
         uint64_t total_nodes = 0;
 
-        // Sort moves alphabetically for consistent output
         std::sort(legal_moves.begin(), legal_moves.end(), [](Move a, Move b){
             return moveToString(a) < moveToString(b);
         });
@@ -611,13 +739,13 @@ public:
 
         Bitboard check_resolution_mask = ~0ULL;
 
-        if (num_checkers > 1) { // Double check, only king moves are possible.
+        if (num_checkers > 1) { // Double check
             add_king_moves(p, king_sq, moves);
             return;
         }
         if (num_checkers == 1) { // Single check
             int checker_sq = lsb_idx(checkers);
-            check_resolution_mask = (1ULL << checker_sq); // Can capture the checker
+            check_resolution_mask = (1ULL << checker_sq);
             Piece checker_piece = p.piece_at(checker_sq);
 
             if (checker_piece == (is_white ? B_BISHOP : W_BISHOP) ||
@@ -631,7 +759,6 @@ public:
         Bitboard pinned = 0ULL;
         std::array<Bitboard, 64> pin_ray_map{};
 
-        // Refactored Pin Detection
         const Bitboard enemy_rooks_queens = is_white ? (p.bb[B_ROOK] | p.bb[B_QUEEN]) : (p.bb[W_ROOK] | p.bb[W_QUEEN]);
         const Bitboard enemy_bishops_queens = is_white ? (p.bb[B_BISHOP] | p.bb[B_QUEEN]) : (p.bb[W_BISHOP] | p.bb[W_QUEEN]);
 
@@ -655,7 +782,6 @@ public:
             }
         }
 
-        // Generate moves for all non-king pieces, applying masks
         Piece start_p = is_white ? W_PAWN : B_PAWN;
         Piece end_p = is_white ? W_QUEEN : B_QUEEN;
 
@@ -774,168 +900,129 @@ private:
     }
 
     int negamax(Position& p, int remaining_depth, int alpha, int beta,
-            std::vector<uint64_t>& search_path_history,
-            const std::vector<uint64_t>& game_history_hashes, bool isRootNode = false) {
+                std::vector<uint64_t>& search_path_history,
+                const std::vector<uint64_t>& game_history_hashes, bool isRootNode = false ) {
 
-    int original_alpha = alpha;
-    nodes_visited_search++;
+        int original_alpha = alpha;
+        nodes_visited_search++;
 
-    // --- Repetition Checks ---
-    for (uint64_t historical_hash_in_path : search_path_history) {
-        if (historical_hash_in_path == p.currentHash) {
-            return 0; // Draw by repetition in current search path
-        }
-    }
-
-    int game_history_repetitions = 0;
-    for (uint64_t historical_game_hash : game_history_hashes) {
-        if (historical_game_hash == p.currentHash) {
-            game_history_repetitions++;
-        }
-    }
-    if (game_history_repetitions >= 2) {
-        return 0; // Draw by threefold repetition including game history
-    }
-
-    // --- Transposition Table Lookup ---
-    Move tt_best_move_for_this_node = 0;
-    if (p.currentHash != 0) {
-        auto tt_entry_it = transposition_table.find(p.currentHash);
-        if (tt_entry_it != transposition_table.end()) {
-            const TranspositionTableEntry& entry = tt_entry_it->second;
-            if (entry.depth >= remaining_depth) {
-                if (entry.type == TTEntryType::EXACT) return entry.score;
-                if (entry.type == TTEntryType::LOWER_BOUND && entry.score >= beta) return entry.score;
-                if (entry.type == TTEntryType::UPPER_BOUND && entry.score <= alpha) return entry.score;
+        for (uint64_t historical_hash_in_path : search_path_history) {
+            if (historical_hash_in_path == p.currentHash) {
+                return 0;
             }
-            tt_best_move_for_this_node = entry.bestMove;
-        }
-    }
-
-    // --- Base Case: Leaf Node ---
-    if (remaining_depth <= 0) {
-        int eval = evaluateMaterial(p); // Replace with a more complex evaluation
-        return p.whiteToMove ? eval : -eval;
-    }
-
-    // --- Move Generation ---
-    std::vector<Move> moves;
-    generateMoves(p, moves);
-
-    // --- Base Case: No Legal Moves (Checkmate or Stalemate) ---
-    if (moves.empty()) {
-        int king_piece_idx = p.whiteToMove ? W_KING : B_KING;
-        int king_sq = lsb_idx(p.bb[king_piece_idx]);
-        if (isSquareAttacked(p, king_sq, !p.whiteToMove)) {
-            return -INF + (this->maxDepth - remaining_depth); // Checkmate
-        }
-        return 0; // Stalemate
-    }
-
-    // --- Move Ordering ---
-    // 1. Prioritize the TT move by swapping it to the front.
-    size_t sort_start_index = 0;
-    if (tt_best_move_for_this_node != 0) {
-        auto it = std::find(moves.begin(), moves.end(), tt_best_move_for_this_node);
-        if (it != moves.end()) {
-            std::iter_swap(moves.begin(), it);
-            sort_start_index = 1; // The rest of the moves start from index 1
-        }
-    }
-
-    // Only sort if there are moves remaining after the potential TT move.
-    if (moves.size() > sort_start_index) {
-        // 2. Score the remaining moves ONCE to avoid repeated calculations.
-        std::vector<std::pair<int, Move>> scored_moves;
-        scored_moves.reserve(moves.size() - sort_start_index);
-        for (size_t i = sort_start_index; i < moves.size(); ++i) {
-            scored_moves.emplace_back(scoreMove(p, moves[i]), moves[i]);
         }
 
-        // 3. Find and sort the top N moves from the scored list.
-        const size_t num_moves_to_sort = 5; // A reasonable number to sort
-        const size_t top_n_boundary = std::min(scored_moves.size(), num_moves_to_sort);
-
-        if (top_n_boundary > 0) {
-            // A. Partition the list to bring the top N moves to the front (O(N)).
-            std::nth_element(
-                scored_moves.begin(),
-                scored_moves.begin() + top_n_boundary - 1,
-                scored_moves.end(),
-                [](const auto& a, const auto& b) { return a.first > b.first; }
-            );
-
-            // B. Sort only those top N moves (O(K log K)).
-            std::sort(
-                scored_moves.begin(),
-                scored_moves.begin() + top_n_boundary,
-                [](const auto& a, const auto& b) { return a.first > b.first; }
-            );
+        int game_history_repetitions = 0;
+        for (uint64_t historical_game_hash : game_history_hashes) {
+            if (historical_game_hash == p.currentHash) {
+                game_history_repetitions++;
+            }
         }
-        
-        // 4. Place the re-ordered moves back into the original vector.
-        for (size_t i = 0; i < scored_moves.size(); ++i) {
-            moves[sort_start_index + i] = scored_moves[i].second;
+        if (game_history_repetitions >= 2) {
+            return 0;
         }
-    }
-    
-    // --- Negamax Search ---
-    search_path_history.push_back(p.currentHash);
 
-    int best_score_for_node = -INF - 1000;
-    Move best_move_found_this_node = 0;
-
-    for (Move m : moves) {
-        Position child_pos = p;
-        applyMove(child_pos, m);
-
-        int score = -negamax(child_pos, remaining_depth - 1, -beta, -alpha, search_path_history, game_history_hashes, false);
-
-        if (score > best_score_for_node) {
-            best_score_for_node = score;
-            best_move_found_this_node = m;
-        }
-        if (score > alpha) {
-            alpha = score;
-        }
-        if (alpha >= beta) { // Beta-cutoff
-            search_path_history.pop_back();
-            if (p.currentHash != 0) {
-                TranspositionTableEntry new_entry;
-                new_entry.zobristHash = p.currentHash;
-                new_entry.depth = remaining_depth;
-                new_entry.score = best_score_for_node;
-                new_entry.bestMove = best_move_found_this_node;
-                new_entry.type = TTEntryType::LOWER_BOUND;
-                auto existing_entry_it = transposition_table.find(p.currentHash);
-                if (existing_entry_it == transposition_table.end() || remaining_depth >= existing_entry_it->second.depth) {
-                    transposition_table[p.currentHash] = new_entry;
+        Move tt_best_move_for_this_node = 0;
+        if (p.currentHash != 0) {
+            auto tt_entry_it = transposition_table.find(p.currentHash);
+            if (tt_entry_it != transposition_table.end()) {
+                const TranspositionTableEntry& entry = tt_entry_it->second;
+                if (entry.depth >= remaining_depth) {
+                    if (entry.type == TTEntryType::EXACT) return entry.score;
+                    if (entry.type == TTEntryType::LOWER_BOUND && entry.score >= beta) return entry.score;
+                    if (entry.type == TTEntryType::UPPER_BOUND && entry.score <= alpha) return entry.score;
                 }
+                tt_best_move_for_this_node = entry.bestMove;
             }
-            return alpha;
         }
-    }
-    search_path_history.pop_back();
 
-    // --- Store Result in Transposition Table ---
-    if (p.currentHash != 0) {
-        TranspositionTableEntry new_entry;
-        new_entry.zobristHash = p.currentHash;
-        new_entry.depth = remaining_depth;
-        new_entry.score = best_score_for_node;
-        new_entry.bestMove = best_move_found_this_node;
-        if (best_score_for_node <= original_alpha) {
-            new_entry.type = TTEntryType::UPPER_BOUND;
-        } else {
-            new_entry.type = TTEntryType::EXACT;
+        if (remaining_depth <= 0) {
+            int eval = evaluateMaterial(p);
+            return p.whiteToMove ? eval : -eval;
         }
-        auto existing_entry_it = transposition_table.find(p.currentHash);
-        if (existing_entry_it == transposition_table.end() || remaining_depth >= existing_entry_it->second.depth) {
-            transposition_table[p.currentHash] = new_entry;
+
+        std::vector<Move> moves;
+        generateMoves(p, moves);
+
+        if (moves.empty()) {
+            int king_piece_idx = p.whiteToMove ? W_KING : B_KING;
+            int king_sq = lsb_idx(p.bb[king_piece_idx]);
+            if (isSquareAttacked(p, king_sq, !p.whiteToMove)) {
+                return -INF + (this->maxDepth - remaining_depth); // Checkmate
+            }
+            return 0; // Stalemate
         }
+
+        if (tt_best_move_for_this_node != 0) {
+            auto it = std::find(moves.begin(), moves.end(), tt_best_move_for_this_node);
+            if (it != moves.end() && it != moves.begin()) {
+                std::rotate(moves.begin(), it, it + 1);
+            }
+        }
+        size_t sort_start_index = (tt_best_move_for_this_node != 0 && !moves.empty() && moves[0] == tt_best_move_for_this_node) ? 1 : 0;
+        if (moves.size() > sort_start_index + 1) {
+            std::sort(moves.begin() + sort_start_index, moves.end(),
+                [&](Move a, Move b) {
+                    return scoreMove(p, a) > scoreMove(p, b);
+                }
+            );
+        }
+
+        search_path_history.push_back(p.currentHash);
+
+        int best_score_for_node = -INF - 1000;
+        Move best_move_found_this_node = 0;
+
+        for (Move m : moves) {
+            Position child_pos = p;
+            applyMove(child_pos, m);
+
+            int score = -negamax(child_pos, remaining_depth - 1, -beta, -alpha, search_path_history, game_history_hashes, false);
+
+            if (score > best_score_for_node) {
+                best_score_for_node = score;
+                best_move_found_this_node = m;
+            }
+            if (score > alpha) {
+                alpha = score;
+            }
+            if (alpha >= beta) {
+                search_path_history.pop_back();
+                if (p.currentHash != 0) {
+                    TranspositionTableEntry new_entry;
+                    new_entry.zobristHash = p.currentHash;
+                    new_entry.depth = remaining_depth;
+                    new_entry.score = best_score_for_node;
+                    new_entry.bestMove = best_move_found_this_node;
+                    new_entry.type = TTEntryType::LOWER_BOUND;
+                    auto existing_entry_it = transposition_table.find(p.currentHash);
+                    if (existing_entry_it == transposition_table.end() || remaining_depth >= existing_entry_it->second.depth) {
+                        transposition_table[p.currentHash] = new_entry;
+                    }
+                }
+                return alpha;
+            }
+        }
+        search_path_history.pop_back();
+
+        if (p.currentHash != 0) {
+            TranspositionTableEntry new_entry;
+            new_entry.zobristHash = p.currentHash;
+            new_entry.depth = remaining_depth;
+            new_entry.score = best_score_for_node;
+            new_entry.bestMove = best_move_found_this_node;
+            if (best_score_for_node <= original_alpha) {
+                new_entry.type = TTEntryType::UPPER_BOUND;
+            } else {
+                new_entry.type = TTEntryType::EXACT;
+            }
+             auto existing_entry_it = transposition_table.find(p.currentHash);
+            if (existing_entry_it == transposition_table.end() || remaining_depth >= existing_entry_it->second.depth) {
+                transposition_table[p.currentHash] = new_entry;
+            }
+        }
+        return best_score_for_node;
     }
-    return best_score_for_node;
-}
 
     void add_pawn_moves(const Position& p, int from_sq, std::vector<Move>& moves, Bitboard target_mask) const {
         const bool is_white = p.whiteToMove;
@@ -944,10 +1031,9 @@ private:
         const Bitboard promotion_rank = is_white ? RANK_8 : RANK_1;
         const Bitboard start_rank = is_white ? RANK_2 : RANK_7;
 
-        // 1. Pawn Pushes
         int to_sq_one_step = from_sq + dir;
-        if (!(p.occ & (1ULL << to_sq_one_step))) { // If square in front is empty
-            if (target_mask & (1ULL << to_sq_one_step)) { // And move is on pin-ray / resolves check
+        if (!(p.occ & (1ULL << to_sq_one_step))) {
+            if (target_mask & (1ULL << to_sq_one_step)) {
                 if (promotion_rank & (1ULL << to_sq_one_step)) {
                     moves.push_back(encodeMove(from_sq, to_sq_one_step, PROMO_TYPE_Q));
                     moves.push_back(encodeMove(from_sq, to_sq_one_step, PROMO_TYPE_R));
@@ -958,18 +1044,16 @@ private:
                 }
             }
 
-            // 2. Double Pawn Push
             if (start_rank & (1ULL << from_sq)) {
                 int to_sq_two_steps = from_sq + dir * 2;
-                if (!(p.occ & (1ULL << to_sq_two_steps))) { // If two squares in front is empty
-                    if (target_mask & (1ULL << to_sq_two_steps)) { // And move is on pin-ray / resolves check
+                if (!(p.occ & (1ULL << to_sq_two_steps))) {
+                    if (target_mask & (1ULL << to_sq_two_steps)) {
                         moves.push_back(encodeMove(from_sq, to_sq_two_steps, PROMO_TYPE_NONE, DPP_FLAG));
                     }
                 }
             }
         }
 
-        // 3. Pawn Captures
         Bitboard pawn_attacks = attacks::pawn_attacks_table[is_white ? 0 : 1][from_sq];
         Bitboard valid_captures = pawn_attacks & enemy_pieces & target_mask;
         while (valid_captures) {
@@ -985,15 +1069,9 @@ private:
             valid_captures &= valid_captures - 1;
         }
 
-        // 4. En Passant
         if (p.epSquare != -1) {
-            // The target square for an e.p. capture must be in the target_mask.
-            // This handles cases where the capturing pawn is pinned.
             if (target_mask & (1ULL << p.epSquare)) {
-                // Check if the pawn actually attacks the en-passant square.
                 if (attacks::pawn_attacks_table[is_white ? 0 : 1][from_sq] & (1ULL << p.epSquare)) {
-                    // This is the special case: check for a horizontal discovered attack on the king.
-                    // This happens when the king, the capturing pawn, and the captured pawn are all on the same rank.
                     int captured_pawn_sq = p.epSquare + (is_white ? -8 : 8);
                     Bitboard occupancy_without_pawns = (p.occ ^ (1ULL << from_sq) ^ (1ULL << captured_pawn_sq));
                     int king_sq = lsb_idx(p.bb[is_white ? W_KING : B_KING]);
@@ -1001,7 +1079,6 @@ private:
                     const Bitboard enemy_rooks_queens = is_white ? (p.bb[B_ROOK] | p.bb[B_QUEEN]) : (p.bb[W_ROOK] | p.bb[W_QUEEN]);
                     const Bitboard enemy_bishops_queens = is_white ? (p.bb[B_BISHOP] | p.bb[B_QUEEN]) : (p.bb[W_BISHOP] | p.bb[W_QUEEN]);
 
-                    // If removing both pawns does not result in the king being attacked, the move is legal.
                     if ((attacks::get_rook_attacks(king_sq, occupancy_without_pawns) & enemy_rooks_queens) == 0 &&
                         (attacks::get_bishop_attacks(king_sq, occupancy_without_pawns) & enemy_bishops_queens) == 0)
                     {
@@ -1057,7 +1134,6 @@ private:
             king_moves &= king_moves - 1;
         }
 
-        // Castling
         bool is_white_turn = p.whiteToMove;
         int king_home_sq = is_white_turn ? 4 : 60;
 
@@ -1096,7 +1172,7 @@ private:
                                           (by_white_attacker ? p.bb[W_QUEEN] : p.bb[B_QUEEN]);
         Bitboard rook_queen_attackers   = (by_white_attacker ? p.bb[W_ROOK] : p.bb[B_ROOK]) |
                                           (by_white_attacker ? p.bb[W_QUEEN] : p.bb[B_QUEEN]);
-        int color_idx = by_white_attacker ? 1 : 0; // Pawn attacks are from perspective of color being attacked
+        int color_idx = by_white_attacker ? 1 : 0;
 
         if (attacks::pawn_attacks_table[color_idx][sq_to_check] & pawn_attackers) return true;
         if (attacks::knight_attacks_table[sq_to_check] & knight_attackers) return true;
@@ -1107,7 +1183,6 @@ private:
         return false;
     }
 
-    // **REFACTORED**: Updates mailbox incrementally.
     void applyMove(Position& p, Move m) const {
         int from = fromSquare(m);
         int to   = toSquare(m);
@@ -1115,25 +1190,22 @@ private:
         int flags = moveFlags(m);
 
         Piece moved_piece = p.piece_at(from);
-        Piece captured_piece_on_to_sq = p.piece_at(to); // From mailbox
+        Piece captured_piece_on_to_sq = p.piece_at(to);
 
         if (moved_piece == NO_PIECE) { return; }
 
         uint64_t new_hash = p.currentHash;
         const auto& keys = getZobristKeys();
 
-        // Update hash for pieces, castling, and ep before state changes
         new_hash ^= keys.piece_square_keys[moved_piece][from];
         if (captured_piece_on_to_sq != NO_PIECE) { new_hash ^= keys.piece_square_keys[captured_piece_on_to_sq][to]; }
         if (p.epSquare != -1) { new_hash ^= keys.ep_file_keys[file_of(p.epSquare)]; }
         new_hash ^= keys.castling_keys[p.castlingRights & 0xF];
 
-        // --- Make move on bitboards and mailbox ---
         Bitboard from_bb = 1ULL << from;
         Bitboard to_bb   = 1ULL << to;
         bool original_mover_was_white = p.whiteToMove;
 
-        // Move piece
         p.bb[moved_piece] &= ~from_bb;
         p.mailbox[from] = NO_PIECE;
 
@@ -1156,7 +1228,6 @@ private:
         } else if (captured_piece_on_to_sq != NO_PIECE) {
             actual_captured_piece_type = captured_piece_on_to_sq;
             p.bb[actual_captured_piece_type] &= ~to_bb;
-            // Mailbox at 'to' will be overwritten by moving piece, no extra action needed.
         }
 
         Piece piece_to_place_on_to_sq = moved_piece;
@@ -1214,7 +1285,6 @@ private:
             new_hash ^= keys.ep_file_keys[file_of(p.epSquare)];
         }
 
-        // Update castling rights
         if (moved_piece == W_KING) { p.castlingRights &= ~(Position::WK_CASTLE_MASK | Position::WQ_CASTLE_MASK); }
         else if (moved_piece == B_KING) { p.castlingRights &= ~(Position::BK_CASTLE_MASK | Position::BQ_CASTLE_MASK); }
         if (from == square(0,0) || to == square(0,0)) { p.castlingRights &= ~Position::WQ_CASTLE_MASK; }
